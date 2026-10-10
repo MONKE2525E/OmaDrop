@@ -1,6 +1,7 @@
 """Approval grants are bound to the sender, request and exact file manifest."""
 import importlib.util
 import tempfile
+import threading
 import types
 import unittest
 from pathlib import Path
@@ -88,3 +89,19 @@ class ConsentTests(unittest.TestCase):
             with patch.object(consent, "request_approval") as approval:
                 self.assertFalse(consent.approve(self.handler, ask))
                 approval.assert_not_called()
+
+    def test_failed_progress_reporting_always_releases_upload_slot(self):
+        slots = threading.BoundedSemaphore(1)
+        grant = {"id": "expired", "token": "token", "bytes": 0}
+        for _ in range(3):
+            self.assertTrue(slots.acquire(blocking=False))
+            with patch.object(consent, "report", side_effect=ValueError("expired")) as report:
+                with self.assertRaisesRegex(ValueError, "expired"):
+                    try:
+                        # The initial report is inside the receiver's slot-owned try.
+                        report(grant)
+                    finally:
+                        consent.finish_upload(grant, "failed", slots.release)
+                self.assertEqual(report.call_count, 2)
+            self.assertTrue(slots.acquire(blocking=False))
+            slots.release()

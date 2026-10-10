@@ -28,8 +28,8 @@
          deadline = ReadDeadline()
          plan = None
 +        completed = False
-+        airdrop_consent.report(consent)
          try:
++            airdrop_consent.report(consent)
              receive_budget = ReceiveBudget(DEST, MAX_RECEIVE_PERCENT)
              plan = body_plan(self.headers, receive_budget.byte_limit)
 @@ -892,6 +898,7 @@
@@ -44,7 +44,8 @@
              self.reject(422, f'upload is not a valid bounded DVZip archive: {e}')
              return
          finally:
-+            airdrop_consent.report(consent, 'complete' if completed else 'failed')
-             UPLOAD_SLOTS.release()
++            airdrop_consent.finish_upload(
++                consent, 'complete' if completed else 'failed', UPLOAD_SLOTS.release)
+-            UPLOAD_SLOTS.release()
          self.send_response(200)
          self.send_header('Content-Length', '0')

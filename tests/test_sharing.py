@@ -143,6 +143,70 @@ class LocalSendTests(unittest.IsolatedAsyncioTestCase):
         self.service.quick_transfer({"id": "url", "rtype": "Inbound", "state": "Disconnected", "meta": metadata})
         self.assertEqual(self.service.transfers[key]["bytes"], len("https://example.test/path"))
 
+    async def test_cancel_quickshare_publication_removes_only_its_partial_output(self):
+        self.directory.mkdir()
+        self.service.quick_staging = Path(self.temp.name) / "quick-staging"
+        self.service.quick_staging.mkdir()
+        key = "quickshare:cancel-mid-copy"
+        filename = "large.bin"
+        source = self.service.quick_staging / filename
+        source.write_bytes(b"x" * (1024 * 1024))
+        unrelated = self.service.quick_staging / "other-transfer.bin"
+        unrelated.write_bytes(b"keep")
+        metadata = {
+            "source": {"name": "Test phone"},
+            "files": [filename],
+            "total_bytes": source.stat().st_size,
+        }
+        self.service.quick_transfer({
+            "id": "cancel-mid-copy", "rtype": "Inbound",
+            "state": "WaitingForUserConsent", "meta": metadata,
+        })
+        entered_copy = asyncio.Event()
+
+        async def block_copy():
+            entered_copy.set()
+            await asyncio.Event().wait()
+
+        with patch.object(self.service, "quick_write", new=AsyncMock()) as quick_write, patch.object(
+            self.service, "quick_publication_checkpoint", new=block_copy
+        ):
+            response = await self.control.post("/", json={"command": "accept", "id": key})
+            self.assertEqual(response.status, 200)
+            self.service.quick_transfer({
+                "id": "cancel-mid-copy", "rtype": "Inbound",
+                "state": "Finished", "meta": metadata,
+            })
+            await asyncio.wait_for(entered_copy.wait(), 2)
+            partials = list(self.directory.glob(".omadrop-*.part"))
+            self.assertEqual(len(partials), 1)
+            self.assertGreater(partials[0].stat().st_size, 0)
+
+            self.service.quick_transfer({
+                "id": "cancel-mid-copy", "rtype": "Inbound",
+                "state": "Disconnected", "meta": metadata,
+            })
+            self.assertEqual(self.service.transfers[key]["state"], "transferring")
+            self.assertEqual(unrelated.read_bytes(), b"keep")
+
+            response = await self.control.post("/", json={"command": "cancel", "id": key})
+            self.assertEqual(response.status, 200)
+            self.assertEqual(self.service.transfers[key]["state"], "cancelled")
+            self.assertIsNone(self.service.quick_active)
+            self.assertNotIn(key, self.service.quick_publications)
+            self.assertFalse(source.exists())
+            self.assertFalse(list(self.directory.glob(".omadrop-*.part")))
+            self.assertFalse((self.directory / filename).exists())
+            self.assertEqual(unrelated.read_bytes(), b"keep")
+            quick_write.assert_awaited_with({"action": "CancelTransfer", "id": "cancel-mid-copy"})
+
+        self.service.quick_transfer({
+            "id": "cancel-mid-copy", "rtype": "Inbound",
+            "state": "Disconnected", "meta": metadata,
+        })
+        self.assertEqual(self.service.transfers[key]["state"], "cancelled")
+        self.assertEqual(unrelated.read_bytes(), b"keep")
+
     async def test_airdrop_progress_requires_approved_session_token(self):
         task = asyncio.create_task(self.control.post("/", json={
             "command": "receive-request", "peer": "Test Mac", "files": [{"name": "test.txt", "size": 4}],

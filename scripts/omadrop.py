@@ -374,6 +374,7 @@ class Coordinator:
         self.quick_active = None
         self.quick_files = {}
         self.quick_text = {}
+        self.quick_publications = {}
         self.airdrop_progress = {}
         self.airdrop_owned = False
         self.airdrop_names = None
@@ -397,6 +398,40 @@ class Coordinator:
         self.tasks.add(task)
         task.add_done_callback(self.tasks.discard)
         return task
+
+    def spawn_quick_publication(self, key):
+        task = self.spawn(self.publish_quick_files(key))
+        task.set_name(key)
+        self.quick_publications[key] = task
+        task.add_done_callback(
+            lambda finished, transfer_id=key: self.quick_publication_done(
+                transfer_id, finished
+            )
+        )
+        return task
+
+    def quick_publication_done(self, key, task):
+        if self.quick_publications.get(key) is task:
+            self.quick_publications.pop(key, None)
+        transfer = self.transfers.get(key)
+        if task.cancelled() and transfer and transfer.get("state") in (
+            "cancelled", "rejected"
+        ):
+            self.cleanup_quick_staging(key)
+            if self.quick_active == key:
+                self.quick_active = None
+
+    def cleanup_quick_staging(self, key):
+        if self.quick_staging is not None:
+            for filename in self.quick_files.pop(key, []):
+                try:
+                    (self.quick_staging / safe_name(filename)).unlink(missing_ok=True)
+                except (OSError, ValueError):
+                    pass
+        self.quick_text.pop(key, None)
+
+    async def quick_publication_checkpoint(self):
+        await asyncio.sleep(0)
 
     def channel(self, key, state, reason=""):
         if state != "advertising" and not reason:
@@ -1048,13 +1083,23 @@ class Coordinator:
             "ReceivingFiles": "transferring",
         }.get(state, "waiting")
         previous = self.transfers.get(key, Transfer())
+        was_cancelled = previous.get("state") == "cancelled"
+        publication = self.quick_publications.get(key)
+        publication_running = publication is not None and not publication.done()
+        if was_cancelled and state in ("Finished", "Cancelled", "Rejected", "Disconnected"):
+            mapped = "cancelled"
         if previous.get("state") == "complete" and state == "Disconnected":
             mapped = "complete"
         if inbound and state == "Finished":
-            mapped = "transferring"
-            if key in self.quick_text:
-                self.quick_text[key] = metadata.get("text_payload")
-            self.spawn(self.publish_quick_files(key))
+            if was_cancelled:
+                self.cleanup_quick_staging(key)
+                if self.quick_active == key:
+                    self.quick_active = None
+            else:
+                mapped = "transferring"
+                if key in self.quick_text:
+                    self.quick_text[key] = metadata.get("text_payload")
+                self.spawn_quick_publication(key)
         elif (
             inbound
             and state in ("Cancelled", "Rejected", "Disconnected")
@@ -1062,13 +1107,16 @@ class Coordinator:
             and previous.get("state") != "complete"
         ):
             # Finished is followed by Disconnected; publication may still run.
-            if previous.get("publishing"):
-                mapped = "transferring"
+            if state in ("Cancelled", "Rejected") and publication_running:
+                publication.cancel()
+            if was_cancelled or state == "Cancelled":
+                mapped = "cancelled"
+            if publication_running:
+                if state == "Disconnected" and not was_cancelled:
+                    mapped = "transferring"
             else:
                 self.quick_active = None
-                for path in self.quick_staging.iterdir():
-                    if path.is_file():
-                        path.unlink()
+                self.cleanup_quick_staging(key)
         update = {
             "id": key,
             "name": ", ".join(Path(f).name for f in files)
@@ -1093,12 +1141,18 @@ class Coordinator:
         self.transfers[key] = previous
         if not inbound and mapped not in ACTIVE_STATES:
             cleanup_sent_files(self.outgoing_files.pop(key, []))
-        if inbound and (state == "Finished" or previous.get("publishing")):
+        if inbound and state == "Finished" and not was_cancelled:
             self.transfers[key]["publishing"] = True
+        elif inbound and publication_running:
+            self.transfers[key]["publishing"] = True
+        elif mapped != "transferring":
+            self.transfers[key].pop("publishing", None)
 
     async def publish_quick_files(self, key):
         transfer = self.transfers[key]
         try:
+            if transfer.get("state") == "cancelled":
+                raise asyncio.CancelledError
             folder = Path(self.settings["directory"])
             if key in self.quick_text:
                 payload = self.quick_text.pop(key)
@@ -1106,6 +1160,8 @@ class Coordinator:
                     raise ValueError("Shared text is empty or exceeds the 1 MB limit")
                 if transfer["fileName"] == "website.txt":
                     await open_shared_urls([payload])
+                    if transfer.get("state") == "cancelled":
+                        raise asyncio.CancelledError
                     transfer.update(state="complete", bytes=len(payload.encode()), total=len(payload.encode()))
                     self.quick_files.pop(key, None)
                     return
@@ -1116,7 +1172,7 @@ class Coordinator:
                     output.write(payload.encode("utf-8"))
                 self.quick_files[key] = [filename]
                 transfer.update(bytes=len(payload.encode()), total=len(payload.encode()))
-            for filename in self.quick_files.pop(key, []):
+            for filename in self.quick_files.get(key, []):
                 source_path = self.quick_staging / safe_name(filename)
                 temporary = folder / (".omadrop-" + secrets.token_hex(16) + ".part")
                 try:
@@ -1128,7 +1184,11 @@ class Coordinator:
                         temporary.chmod(0o600)
                         while chunk := source.read(256 * 1024):
                             destination.write(chunk)
-                            await asyncio.sleep(0)
+                            await self.quick_publication_checkpoint()
+                            if transfer.get("state") == "cancelled":
+                                raise asyncio.CancelledError
+                    if transfer.get("state") == "cancelled":
+                        raise asyncio.CancelledError
                     for suffix in range(1000):
                         path = Path(filename)
                         name = (
@@ -1146,12 +1206,24 @@ class Coordinator:
                     source_path.unlink()
                 finally:
                     temporary.unlink(missing_ok=True)
+            if transfer.get("state") == "cancelled":
+                raise asyncio.CancelledError
+            self.quick_files.pop(key, None)
             transfer["state"] = "complete"
+        except asyncio.CancelledError:
+            transfer["state"] = "cancelled"
+            self.cleanup_quick_staging(key)
+            raise
         except Exception as error:
-            transfer.update(state="failed", error=str(error)[:240])
+            if transfer.get("state") == "cancelled":
+                self.cleanup_quick_staging(key)
+            else:
+                transfer.update(state="failed", error=str(error)[:240])
+                self.cleanup_quick_staging(key)
         finally:
             transfer.pop("publishing", None)
-            self.quick_active = None
+            if self.quick_active == key:
+                self.quick_active = None
 
     async def start_airdrop(self):
         if not shutil.which("omdrop"):
@@ -1556,6 +1628,16 @@ class Coordinator:
             elif command == "cancel":
                 key = packet["id"]
                 if key.startswith("quickshare:"):
+                    transfer = self.transfers.get(key)
+                    publication = self.quick_publications.get(key)
+                    if transfer and transfer.get("state") in ACTIVE_STATES:
+                        transfer["state"] = "cancelled"
+                    if publication is not None and not publication.done():
+                        publication.cancel()
+                        await asyncio.gather(publication, return_exceptions=True)
+                        self.cleanup_quick_staging(key)
+                        if self.quick_active == key:
+                            self.quick_active = None
                     await self.quick_write(
                         {"action": "CancelTransfer", "id": key.split(":", 1)[1]}
                     )
@@ -1565,7 +1647,7 @@ class Coordinator:
                     for task in self.tasks:
                         if task.get_name() == key:
                             task.cancel()
-                if key in self.transfers:
+                if key in self.transfers and not key.startswith("quickshare:"):
                     self.transfers[key]["state"] = "cancelled"
             elif command == "send":
                 peer = self.peers.get(packet["peer"])

@@ -173,3 +173,11 @@ def report(grant, state="transferring", count=0):
         if state == "complete":
             raise ValueError("Could not finish the approved transfer") from error
         logging.warning("AirDrop receive progress could not be reported")
+
+
+def finish_upload(grant, state, release_slot):
+    """Report the terminal state and release the bounded receiver slot."""
+    try:
+        report(grant, state)
+    finally:
+        release_slot()
