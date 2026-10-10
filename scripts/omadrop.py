@@ -45,6 +45,7 @@ LOCALSEND_UPLOAD_IDLE_TIMEOUT = 300
 LOCALSEND_RESPONSE_IDLE_TIMEOUT = 300
 LOCALSEND_CHUNK_SIZE = 256 * 1024
 TRANSFER_IDLE_TIMEOUT = 300
+QUICK_CANCEL_ACK_TIMEOUT = 3
 # Keep the receiver-wakeup phase bounded; the sender bounds each HTTP operation.
 AIRDROP_SEND_WAIT = 30
 MAX_MENU_LEASES = 64
@@ -1241,10 +1242,28 @@ class Coordinator:
 
     def quick_transfer(self, data, process=None):
         key = "quickshare:" + data["id"]
-        if process is not None:
-            self.quick_transfer_processes[key] = process
         metadata = data.get("meta") or {}
         inbound = data.get("rtype") == "Inbound"
+        state = data.get("state")
+        previous = self.transfers.get(key, {})
+        if previous.get("state") in ("failed", "cancelled", "rejected", "complete"):
+            if state in ("Finished", "Cancelled", "Rejected", "Disconnected"):
+                if not inbound:
+                    cleanup_sent_files(self.outgoing_files.pop(key, []))
+                    self.quick_transfer_processes.pop(key, None)
+                    return
+                pending = self.incoming.pop(key, None)
+                if pending:
+                    decision = pending.get("decision")
+                    if decision is not None and not decision.done():
+                        decision.set_result(False)
+                if self.quick_active == key:
+                    self.quick_active = None
+                self.cleanup_quick_staging(key)
+                self.quick_transfer_processes.pop(key, None)
+            return
+        if process is not None:
+            self.quick_transfer_processes[key] = process
         if inbound and self.quick_staging is not None:
             self.quick_transfer_staging.setdefault(key, self.quick_staging)
         name = (
@@ -1253,7 +1272,6 @@ class Coordinator:
             or "Nearby device"
         )
         files = metadata.get("files") or []
-        state = data.get("state")
         if state == "WaitingForUserConsent" and inbound:
             try:
                 if len(files) > 100:
@@ -1317,12 +1335,7 @@ class Coordinator:
                 if key in self.quick_text:
                     self.quick_text[key] = metadata.get("text_payload")
                 self.spawn_quick_publication(key)
-        elif (
-            inbound
-            and state in ("Cancelled", "Rejected", "Disconnected")
-            and self.quick_active == key
-            and previous.get("state") != "complete"
-        ):
+        elif inbound and state in ("Cancelled", "Rejected", "Disconnected"):
             # Finished is followed by Disconnected; publication may still run.
             if state in ("Cancelled", "Rejected") and publication_running:
                 publication.cancel()
@@ -1331,8 +1344,10 @@ class Coordinator:
             if publication_running:
                 if state == "Disconnected" and not was_cancelled:
                     mapped = "transferring"
-            else:
+            elif self.quick_active == key and previous.get("state") != "complete":
                 self.quick_active = None
+                self.cleanup_quick_staging(key)
+            elif state in ("Cancelled", "Rejected"):
                 self.cleanup_quick_staging(key)
         update = {
             "id": key,
@@ -1359,11 +1374,9 @@ class Coordinator:
         if not inbound and mapped not in ACTIVE_STATES:
             cleanup_sent_files(self.outgoing_files.pop(key, []))
             self.quick_transfer_processes.pop(key, None)
-        elif (
-            inbound
-            and state in ("Cancelled", "Rejected", "Disconnected")
-            and not publication_running
-        ):
+        elif inbound and state in (
+            "Finished", "Cancelled", "Rejected", "Disconnected"
+        ) and not publication_running:
             self.quick_transfer_processes.pop(key, None)
         if inbound and state == "Finished" and not was_cancelled:
             self.transfers[key]["publishing"] = True
@@ -1436,7 +1449,8 @@ class Coordinator:
             self.quick_files.pop(key, None)
             transfer["state"] = "complete"
         except asyncio.CancelledError:
-            transfer["state"] = "cancelled"
+            if transfer.get("state") in ACTIVE_STATES:
+                transfer["state"] = "cancelled"
             self.cleanup_quick_staging(key)
             raise
         except Exception as error:
@@ -1582,24 +1596,96 @@ class Coordinator:
             self.transfer_watch[key] = (progress, last_progress)
             if now - last_progress < TRANSFER_IDLE_TIMEOUT:
                 continue
-            tasks = [task for task in self.tasks if task.get_name() == key]
-            for task in tasks:
-                task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
-            if key.startswith("quickshare:"):
-                with contextlib.suppress(Exception):
-                    await asyncio.wait_for(self.quick_write(
-                        {"action": "CancelTransfer", "id": key.split(":", 1)[1]}
-                    ), 5)
+            publication = self.quick_publications.get(key)
+            quick_publication_active = (
+                key.startswith("quickshare:")
+                and publication is not None
+                and not publication.done()
+            )
+            pending = self.incoming.pop(key, None)
+            if pending:
+                decision = pending.get("decision")
+                if decision is not None and not decision.done():
+                    decision.set_result(False)
             if key in self.sessions:
                 self.sessions[key]["cancelled"] = True
+                self.sessions.pop(key, None)
             transfer.update(
                 state="failed",
                 error="Transfer timed out after 5 minutes without progress",
             )
+            tasks = [task for task in self.tasks if task.get_name() == key]
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            transfer.update(
+                state="failed",
+                error="Transfer timed out after 5 minutes without progress",
+            )
+            if key.startswith("quickshare:"):
+                await self.cancel_stalled_quickshare(
+                    key, publication_active=quick_publication_active
+                )
+                transfer.update(
+                    state="failed",
+                    error="Transfer timed out after 5 minutes without progress",
+                )
             self.airdrop_progress.pop(key, None)
             cleanup_sent_files(self.outgoing_files.pop(key, []))
             self.transfer_watch.pop(key, None)
+
+    async def cancel_stalled_quickshare(self, key, publication_active=False):
+        if publication_active:
+            # Finished means the engine has stopped writing; publication owns
+            # its own cancellation and staging cleanup.
+            return
+        process = self.quick_transfer_processes.get(key) or self.quick
+        if process is None:
+            self.incoming.pop(key, None)
+            self.cleanup_quick_staging(key)
+            if self.quick_active == key:
+                self.quick_active = None
+        elif process is self.quick and process.returncode is None:
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(
+                    self.quick_write(
+                        {"action": "CancelTransfer", "id": key.split(":", 1)[1]}
+                    ),
+                    5,
+                )
+            deadline = asyncio.get_running_loop().time() + QUICK_CANCEL_ACK_TIMEOUT
+            while (
+                self.quick is process
+                and process.returncode is None
+                and self.quick_transfer_processes.get(key) is process
+                and asyncio.get_running_loop().time() < deadline
+            ):
+                await asyncio.sleep(0.05)
+
+        stop_process = process is not None and (
+            process is not self.quick
+            or (
+                process.returncode is None
+                and self.quick_transfer_processes.get(key) is process
+            )
+        )
+        if stop_process and process.returncode is None:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGTERM)
+            try:
+                await asyncio.wait_for(process.wait(), 3)
+            except TimeoutError:
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(process.pid, signal.SIGKILL)
+                await process.wait()
+        if process is not None and process.returncode is not None:
+            self.quick_process_exited(process)
+
+        if self.running and self.quick is None:
+            try:
+                await self.start_quick()
+            except Exception as error:
+                self.channel("quickshare", "unavailable", str(error)[:240])
 
     async def refresh_airdrop(self):
         try:
@@ -1645,15 +1731,21 @@ class Coordinator:
                 quick_process = self.quick
                 if quick_process is not None:
                     self.quick_transfer_processes[transfer_id] = quick_process
-                await self.quick_write(
-                    {
-                        "action": "send",
-                        "id": transfer_id.split(":", 1)[1],
-                        "name": peer["name"],
-                        "addr": f"{peer['host']}:{peer['port']}",
-                        "files": files,
-                    }
-                )
+                try:
+                    await self.quick_write(
+                        {
+                            "action": "send",
+                            "id": transfer_id.split(":", 1)[1],
+                            "name": peer["name"],
+                            "addr": f"{peer['host']}:{peer['port']}",
+                            "files": files,
+                        }
+                    )
+                except asyncio.CancelledError:
+                    # A cancelled drain may have delivered the command. Keep
+                    # its staged inputs and process ownership until retirement.
+                    quick_dispatched = True
+                    raise
                 quick_dispatched = True
                 return
             if peer["protocol"] == "airdrop":
@@ -1718,7 +1810,8 @@ class Coordinator:
                         raise RuntimeError(f"Upload failed ({response.status})")
             transfer["state"] = "complete"
         except asyncio.CancelledError:
-            transfer["state"] = "cancelled"
+            if transfer.get("state") in ACTIVE_STATES:
+                transfer["state"] = "cancelled"
             if (
                 peer["protocol"] == "localsend"
                 and "session" in locals()

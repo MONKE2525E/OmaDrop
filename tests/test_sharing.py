@@ -314,6 +314,134 @@ class LocalSendTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(staging.exists())
         self.assertIsNone(self.service.quick_active)
 
+    async def test_quickshare_stall_restarts_owned_bridge_and_retires_inbound_state(self):
+        runtime = Path(self.temp.name) / "runtime"
+        runtime.mkdir(mode=0o700)
+        starts = Path(self.temp.name) / "bridge-starts"
+        cancelled = Path(self.temp.name) / "cancelled-transfer"
+        accepted = Path(self.temp.name) / "accepted-transfer"
+        executable = Path(self.temp.name) / "fake-quickshare"
+        executable.write_text(
+            f"#!{sys.executable}\n"
+            "import json,os,pathlib,sys\n"
+            "starts=pathlib.Path(os.environ['FAKE_QUICKSHARE_STARTS'])\n"
+            "count=int(starts.read_text()) if starts.exists() else 0\n"
+            "starts.write_text(str(count+1))\n"
+            "print(json.dumps({'event':'ready'}),flush=True)\n"
+            "for line in sys.stdin:\n"
+            " packet=json.loads(line)\n"
+            " if packet.get('action')=='CancelTransfer':\n"
+            "  pathlib.Path(os.environ['FAKE_QUICKSHARE_CANCEL']).write_text(packet['id'])\n"
+            " elif packet.get('action')=='AcceptTransfer':\n"
+            "  pathlib.Path(os.environ['FAKE_QUICKSHARE_ACCEPT']).write_text(packet['id'])\n"
+        )
+        executable.chmod(0o700)
+        self.directory.mkdir()
+        self.service.quick_path = str(executable)
+        self.service.start_quick = lambda: omadrop.Coordinator.start_quick(
+            self.service
+        )
+
+        with patch.dict(
+            os.environ,
+            {
+                "OMADROP_RUNTIME_DIR": str(runtime),
+                "FAKE_QUICKSHARE_STARTS": str(starts),
+                "FAKE_QUICKSHARE_CANCEL": str(cancelled),
+                "FAKE_QUICKSHARE_ACCEPT": str(accepted),
+            },
+        ), patch.object(omadrop, "QUICK_CANCEL_ACK_TIMEOUT", 0.05), patch.object(
+            omadrop, "TRANSFER_IDLE_TIMEOUT", 0.01
+        ):
+            await omadrop.Coordinator.start_quick(self.service)
+            old_process = self.service.quick
+            old_staging = self.service.quick_staging
+            partial = old_staging / "incoming.bin"
+            unrelated = old_staging / "unrelated.bin"
+            partial.write_bytes(b"partial inbound data")
+            unrelated.write_bytes(b"preserve this file")
+
+            old_key = "quickshare:stalled-inbound"
+            self.service.quick_files[old_key] = [partial.name]
+            self.service.quick_transfer_staging[old_key] = old_staging
+            self.service.quick_transfer_processes[old_key] = old_process
+            self.service.quick_active = old_key
+            self.service.transfers[old_key] = omadrop.Transfer({
+                "id": old_key,
+                "name": partial.name,
+                "peer": "Stalled sender",
+                "protocol": "quickshare",
+                "direction": "in",
+                "bytes": 0,
+                "total": 100,
+                "state": "transferring",
+                "error": "",
+                "files": 1,
+                "fileName": partial.name,
+            })
+            self.service.transfer_watch[old_key] = (
+                ("transferring", 0), time.monotonic() - 1
+            )
+
+            await self.service.expire_stalled_transfers()
+
+            new_process = self.service.quick
+            self.assertIsNotNone(
+                new_process, self.service.channels["quickshare"]["reason"]
+            )
+            self.assertNotEqual(new_process.pid, old_process.pid)
+            self.assertIsNotNone(old_process.returncode)
+            self.assertTrue(self.service.running)
+            self.assertEqual(starts.read_text(), "2")
+            self.assertEqual(cancelled.read_text(), "stalled-inbound")
+            self.assertEqual(self.service.transfers[old_key]["state"], "failed")
+            self.assertNotIn(old_key, self.service.quick_files)
+            self.assertIsNone(self.service.quick_active)
+            self.assertFalse(partial.exists())
+            self.assertEqual(unrelated.read_bytes(), b"preserve this file")
+
+            new_metadata = {
+                "source": {"name": "New sender"},
+                "files": ["new.bin"],
+                "total_bytes": 4,
+            }
+            self.service.quick_transfer(
+                {
+                    "id": "new-inbound",
+                    "rtype": "Inbound",
+                    "state": "WaitingForUserConsent",
+                    "meta": new_metadata,
+                },
+                process=new_process,
+            )
+            new_key = "quickshare:new-inbound"
+            response = await self.control.post(
+                "/", json={"command": "accept", "id": new_key}
+            )
+            self.assertEqual(response.status, 200)
+            self.assertEqual(self.service.quick_active, new_key)
+            self.assertEqual(accepted.read_text(), "new-inbound")
+
+            self.service.quick_transfer(
+                {
+                    "id": "stalled-inbound",
+                    "rtype": "Inbound",
+                    "state": "Finished",
+                    "meta": {
+                        "source": {"name": "Stalled sender"},
+                        "files": [partial.name],
+                        "total_bytes": 100,
+                    },
+                },
+                process=old_process,
+            )
+
+        self.assertEqual(self.service.transfers[old_key]["state"], "failed")
+        self.assertFalse((self.directory / partial.name).exists())
+        self.assertEqual(self.service.quick_active, new_key)
+        self.assertIn(new_key, self.service.quick_files)
+        self.assertTrue(self.service.quick_staging.exists())
+
     async def test_quickshare_bridge_exit_preserves_independent_publication(self):
         self.directory.mkdir()
         staging = Path(self.temp.name) / "quickshare-publishing"
@@ -1695,6 +1823,46 @@ class LocalSendTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(
             list(Path(receiver.settings["directory"]).glob(".omadrop-*.part"))
         )
+
+    async def test_localsend_watchdog_releases_all_abandoned_accepted_sessions(self):
+        now = time.monotonic()
+        for index in range(16):
+            key = f"abandoned-session-{index}"
+            self.service.sessions[key] = {
+                "files": {},
+                "host": "127.0.0.1",
+                "directory": self.directory,
+                "expires": now + omadrop.LOCALSEND_SESSION_IDLE_TIMEOUT,
+                "cancelled": False,
+            }
+            self.service.transfers[key] = omadrop.Transfer({
+                "id": key,
+                "name": "abandoned.txt",
+                "peer": "Abandoned sender",
+                "protocol": "localsend",
+                "direction": "in",
+                "bytes": 0,
+                "total": 100,
+                "state": "waiting",
+                "error": "",
+                "files": 1,
+                "fileName": "abandoned.txt",
+            })
+            self.service.transfer_watch[key] = (
+                ("waiting", 0), now - omadrop.TRANSFER_IDLE_TIMEOUT - 1
+            )
+
+        await self.service.expire_stalled_transfers()
+
+        self.assertFalse(self.service.sessions)
+        for index in range(16):
+            key = f"abandoned-session-{index}"
+            self.assertEqual(self.service.transfers[key]["state"], "failed")
+
+        task, request_id = await self.prepare(name="after-timeout.txt")
+        self.assertFalse(task.done())
+        session = await self.approve(task, request_id)
+        self.assertIn(session["sessionId"], self.service.sessions)
 
     async def test_unsafe_quickshare_filename_is_rejected_before_consent(self):
         actions = []
