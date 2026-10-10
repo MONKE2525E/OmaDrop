@@ -414,6 +414,60 @@ class LocalSendTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.sleep(0.01)
             self.assertEqual(self.service.transfers[transfer_id]["error"], "Recipient unreachable")
 
+    async def test_cancel_outgoing_airdrop_stops_send_and_cleans_staged_files(self):
+        runtime = Path(self.temp.name) / "runtime"
+        runtime.mkdir(mode=0o700)
+        clipboard = runtime / "clipboard"
+        staged_dir = clipboard / "clipboard-airdrop"
+        unrelated_dir = clipboard / "clipboard-unrelated"
+        staged_dir.mkdir(parents=True)
+        unrelated_dir.mkdir()
+        staged_file = staged_dir / "clipboard.txt"
+        unrelated_file = unrelated_dir / "keep.txt"
+        staged_file.write_text("staged content")
+        unrelated_file.write_text("keep this")
+        peer = {
+            "id": "airdrop:test", "name": "Test Mac", "protocol": "airdrop",
+            "mac": "test",
+        }
+        self.service.peers[peer["id"]] = peer
+        send_started = asyncio.Event()
+        send_cancelled = asyncio.Event()
+
+        async def blocked_send(*args, **kwargs):
+            send_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                send_cancelled.set()
+                raise
+
+        with patch.dict(os.environ, {"OMADROP_RUNTIME_DIR": str(runtime)}), patch.object(
+            omadrop, "run_command", new=blocked_send
+        ):
+            response = await self.control.post("/", json={
+                "command": "send", "peer": peer["id"], "files": [str(staged_file)],
+            })
+            data = await response.json()
+            self.assertEqual(response.status, 200)
+            transfer_id = data["transferId"]
+            task = next(task for task in self.service.tasks if task.get_name() == transfer_id)
+            await asyncio.wait_for(send_started.wait(), 2)
+            self.assertEqual(self.service.transfers[transfer_id]["state"], "transferring")
+
+            response = await self.control.post("/", json={
+                "command": "cancel", "id": transfer_id,
+            })
+            self.assertEqual(response.status, 200)
+            await asyncio.wait_for(send_cancelled.wait(), 2)
+            await asyncio.gather(task, return_exceptions=True)
+
+        self.assertTrue(task.cancelled())
+        self.assertEqual(self.service.transfers[transfer_id]["state"], "cancelled")
+        self.assertNotIn(transfer_id, self.service.outgoing_files)
+        self.assertFalse(staged_file.exists())
+        self.assertTrue(unrelated_file.exists())
+
     async def asyncSetUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="omadrop-test-")
         self.environment = patch.dict(

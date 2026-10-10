@@ -1651,12 +1651,16 @@ class Coordinator:
                     session = self.sessions[key]
                     session["cancelled"] = True
                     self.sessions.pop(key)
-                elif key.startswith("airdrop:"):
+                elif (
+                    key.startswith("airdrop:")
+                    and self.transfers.get(key, {}).get("direction") == "in"
+                ):
                     self.airdrop_progress.pop(key, None)
                 else:
-                    for task in self.tasks:
-                        if task.get_name() == key:
-                            task.cancel()
+                    tasks = [task for task in self.tasks if task.get_name() == key]
+                    for task in tasks:
+                        task.cancel()
+                    await asyncio.gather(*tasks, return_exceptions=True)
                 if (
                     key in self.transfers
                     and not key.startswith("quickshare:")
