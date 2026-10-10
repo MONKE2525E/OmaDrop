@@ -268,6 +268,183 @@ class LocalSendTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(original.exists())
         self.assertFalse(staged.exists())
 
+    async def test_quickshare_cancel_dispatch_failure_cleans_only_staged_inputs(self):
+        runtime = Path(self.temp.name) / "runtime"
+        runtime.mkdir(mode=0o700)
+        failed_dir = runtime / "clipboard" / "clipboard-cancel-failed"
+        unrelated_dir = runtime / "clipboard" / "clipboard-unrelated"
+        failed_dir.mkdir(parents=True)
+        unrelated_dir.mkdir()
+        original = Path(self.temp.name) / "original.jpg"
+        staged = failed_dir / "clipboard.jpg"
+        unrelated = unrelated_dir / "other.jpg"
+        original.write_bytes(b"user original")
+        staged.write_bytes(b"staged clipboard copy")
+        unrelated.write_bytes(b"unrelated staged copy")
+        peer = {
+            "id": "quickshare:test-phone", "name": "Test phone",
+            "protocol": "quickshare", "host": "127.0.0.1", "port": 12345,
+        }
+        self.service.peers[peer["id"]] = peer
+        with patch.dict(os.environ, {"OMADROP_RUNTIME_DIR": str(runtime)}):
+            with patch.object(
+                self.service, "quick_write", new=AsyncMock()
+            ) as quick_write:
+                response = await self.control.post("/", json={
+                    "command": "send", "peer": peer["id"],
+                    "files": [str(original), str(staged)],
+                })
+                self.assertEqual(response.status, 200)
+                transfer_id = (await response.json())["transferId"]
+                for _ in range(100):
+                    if quick_write.await_count:
+                        break
+                    await asyncio.sleep(0.01)
+                self.assertEqual(quick_write.await_count, 1)
+                await asyncio.sleep(0)
+                self.assertIn(transfer_id, self.service.outgoing_files)
+
+            self.service.quick_transfer({
+                "id": transfer_id.split(":", 1)[1], "rtype": "Outbound",
+                "state": "SendingFiles",
+                "meta": {"source": {"name": "Test phone"}, "files": [staged.name]},
+            })
+            self.assertEqual(self.service.transfers[transfer_id]["state"], "transferring")
+            self.service.quick = None  # The bridge exited before CancelTransfer.
+
+            response = await self.control.post("/", json={
+                "command": "cancel", "id": transfer_id,
+            })
+            error = await response.json()
+
+        self.assertEqual(response.status, 400)
+        self.assertEqual(error, {"error": "Quick Share is not running"})
+        self.assertEqual(self.service.transfers[transfer_id]["state"], "failed")
+        self.assertEqual(self.service.transfers[transfer_id]["error"], error["error"])
+        self.assertNotIn(transfer_id, self.service.outgoing_files)
+        self.assertTrue(original.exists())
+        self.assertFalse(staged.exists())
+        self.assertEqual(unrelated.read_bytes(), b"unrelated staged copy")
+
+    async def test_quickshare_cancel_waits_for_terminal_event_after_dispatch(self):
+        runtime = Path(self.temp.name) / "runtime"
+        runtime.mkdir(mode=0o700)
+        staged_dir = runtime / "clipboard" / "clipboard-cancel-success"
+        staged_dir.mkdir(parents=True)
+        original = Path(self.temp.name) / "original.txt"
+        staged = staged_dir / "clipboard.txt"
+        original.write_text("user original")
+        staged.write_text("staged copy")
+        peer = {
+            "id": "quickshare:test-phone", "name": "Test phone",
+            "protocol": "quickshare", "host": "127.0.0.1", "port": 12345,
+        }
+        self.service.peers[peer["id"]] = peer
+        with patch.dict(os.environ, {"OMADROP_RUNTIME_DIR": str(runtime)}), patch.object(
+            self.service, "quick_write", new=AsyncMock()
+        ) as quick_write:
+            response = await self.control.post("/", json={
+                "command": "send", "peer": peer["id"], "files": [str(staged)],
+            })
+            self.assertEqual(response.status, 200)
+            transfer_id = (await response.json())["transferId"]
+            for _ in range(100):
+                if quick_write.await_count:
+                    break
+                await asyncio.sleep(0.01)
+            self.assertEqual(quick_write.await_count, 1)
+            await asyncio.sleep(0)
+            self.assertIn(transfer_id, self.service.outgoing_files)
+            self.service.quick_transfer({
+                "id": transfer_id.split(":", 1)[1], "rtype": "Outbound",
+                "state": "SendingFiles",
+                "meta": {"source": {"name": "Test phone"}, "files": [staged.name]},
+            })
+
+            response = await self.control.post("/", json={
+                "command": "cancel", "id": transfer_id,
+            })
+            self.assertEqual(response.status, 200)
+            self.assertEqual(self.service.transfers[transfer_id]["state"], "cancelled")
+            self.assertIn(transfer_id, self.service.outgoing_files)
+            self.assertTrue(staged.exists())
+            self.service.quick_transfer({
+                "id": transfer_id.split(":", 1)[1], "rtype": "Outbound",
+                "state": "Cancelled",
+                "meta": {"source": {"name": "Test phone"}, "files": [staged.name]},
+            })
+
+        self.assertNotIn(transfer_id, self.service.outgoing_files)
+        self.assertTrue(original.exists())
+        self.assertFalse(staged.exists())
+
+    async def test_quickshare_cancel_failure_keeps_inbound_staging_while_bridge_runs(self):
+        self.service.quick_staging = Path(self.temp.name) / "quick-staging"
+        self.service.quick_staging.mkdir()
+        key = "quickshare:inbound-cancel"
+        filename = "incoming.bin"
+        staged = self.service.quick_staging / filename
+        staged.write_bytes(b"engine-owned bytes")
+        self.service.quick_files[key] = [filename]
+        self.service.quick_active = key
+        self.service.quick_transfer({
+            "id": "inbound-cancel", "rtype": "Inbound", "state": "ReceivingFiles",
+            "meta": {"source": {"name": "Test phone"}, "files": [filename]},
+        })
+
+        class RunningBridge:
+            returncode = None
+
+            async def wait(self):
+                await asyncio.Event().wait()
+
+        self.service.quick = RunningBridge()
+        try:
+            with patch.object(
+                self.service, "quick_write",
+                new=AsyncMock(side_effect=RuntimeError("bridge input failed")),
+            ):
+                response = await self.control.post("/", json={
+                    "command": "cancel", "id": key,
+                })
+                error = await response.json()
+        finally:
+            self.service.quick = None
+
+        self.assertEqual(response.status, 400)
+        self.assertEqual(error, {"error": "bridge input failed"})
+        self.assertEqual(self.service.transfers[key]["state"], "transferring")
+        self.assertEqual(self.service.quick_files[key], [filename])
+        self.assertEqual(self.service.quick_active, key)
+        self.assertEqual(staged.read_bytes(), b"engine-owned bytes")
+
+    async def test_quickshare_cancel_failure_cleans_inbound_staging_after_bridge_stops(self):
+        self.service.quick_staging = Path(self.temp.name) / "quick-staging"
+        self.service.quick_staging.mkdir()
+        key = "quickshare:inbound-stopped"
+        filename = "incoming.bin"
+        staged = self.service.quick_staging / filename
+        staged.write_bytes(b"engine-owned bytes")
+        self.service.quick_files[key] = [filename]
+        self.service.quick_active = key
+        self.service.quick_transfer({
+            "id": "inbound-stopped", "rtype": "Inbound", "state": "ReceivingFiles",
+            "meta": {"source": {"name": "Test phone"}, "files": [filename]},
+        })
+
+        response = await self.control.post("/", json={
+            "command": "cancel", "id": key,
+        })
+        error = await response.json()
+
+        self.assertEqual(response.status, 400)
+        self.assertEqual(error, {"error": "Quick Share is not running"})
+        self.assertEqual(self.service.transfers[key]["state"], "failed")
+        self.assertEqual(self.service.transfers[key]["error"], error["error"])
+        self.assertNotIn(key, self.service.quick_files)
+        self.assertIsNone(self.service.quick_active)
+        self.assertFalse(staged.exists())
+
     async def test_airdrop_progress_requires_approved_session_token(self):
         task = asyncio.create_task(self.control.post("/", json={
             "command": "receive-request", "peer": "Test Mac", "files": [{"name": "test.txt", "size": 4}],

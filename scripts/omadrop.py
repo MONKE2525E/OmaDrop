@@ -983,6 +983,16 @@ class Coordinator:
         self.quick.stdin.write((json.dumps(message) + "\n").encode())
         await self.quick.stdin.drain()
 
+    async def quick_process_stopped(self):
+        process = self.quick
+        if process is None or process.returncode is not None:
+            return True
+        try:
+            await asyncio.wait_for(process.wait(), timeout=0.25)
+        except TimeoutError:
+            return False
+        return True
+
     async def quick_events(self):
         while self.quick:
             line = await self.quick.stdout.readline()
@@ -1086,7 +1096,7 @@ class Coordinator:
         was_cancelled = previous.get("state") == "cancelled"
         publication = self.quick_publications.get(key)
         publication_running = publication is not None and not publication.done()
-        if was_cancelled and state in ("Finished", "Cancelled", "Rejected", "Disconnected"):
+        if was_cancelled:
             mapped = "cancelled"
         if previous.get("state") == "complete" and state == "Disconnected":
             mapped = "complete"
@@ -1636,17 +1646,38 @@ class Coordinator:
                 if key.startswith("quickshare:"):
                     transfer = self.transfers.get(key)
                     publication = self.quick_publications.get(key)
-                    if transfer and transfer.get("state") in ACTIVE_STATES:
-                        transfer["state"] = "cancelled"
+                    publication_cancelled = False
                     if publication is not None and not publication.done():
+                        if transfer and transfer.get("state") in ACTIVE_STATES:
+                            transfer["state"] = "cancelled"
                         publication.cancel()
                         await asyncio.gather(publication, return_exceptions=True)
                         self.cleanup_quick_staging(key)
                         if self.quick_active == key:
                             self.quick_active = None
-                    await self.quick_write(
-                        {"action": "CancelTransfer", "id": key.split(":", 1)[1]}
-                    )
+                        publication_cancelled = True
+                    try:
+                        await self.quick_write(
+                            {"action": "CancelTransfer", "id": key.split(":", 1)[1]}
+                        )
+                    except Exception as error:
+                        if await self.quick_process_stopped():
+                            if transfer and transfer.get("state") in ACTIVE_STATES:
+                                transfer.update(state="failed", error=str(error)[:240])
+                            if transfer and transfer.get("direction") == "out":
+                                cleanup_sent_files(self.outgoing_files.pop(key, []))
+                            else:
+                                self.cleanup_quick_staging(key)
+                                if self.quick_active == key:
+                                    self.quick_active = None
+                        raise
+                    else:
+                        if (
+                            not publication_cancelled
+                            and transfer
+                            and transfer.get("state") in ACTIVE_STATES
+                        ):
+                            transfer["state"] = "cancelled"
                 elif key in self.sessions:
                     session = self.sessions[key]
                     session["cancelled"] = True
