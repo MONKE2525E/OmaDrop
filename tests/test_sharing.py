@@ -844,6 +844,74 @@ class LocalSendTests(unittest.IsolatedAsyncioTestCase):
         response = await self.control.post("/", json=packet)
         self.assertEqual(response.status, 400)
 
+    async def test_airdrop_zero_byte_heartbeats_reset_idle_watchdog_without_fake_progress(self):
+        task = asyncio.create_task(self.control.post("/", json={
+            "command": "receive-request", "peer": "Test Mac",
+            "files": [{"name": "large.zip", "size": 10}],
+        }))
+        for _ in range(100):
+            if self.service.incoming:
+                break
+            await asyncio.sleep(0.01)
+        key = next(iter(self.service.incoming))
+        await self.control.post("/", json={"command": "accept", "id": key})
+        approval = await (await task).json()
+        heartbeat = {
+            "command": "receive-progress", "id": key,
+            "token": approval["token"], "bytes": 0, "state": "transferring",
+        }
+
+        with patch.object(omadrop, "TRANSFER_IDLE_TIMEOUT", 0.12):
+            await self.service.expire_stalled_transfers()
+            for _ in range(5):
+                await asyncio.sleep(0.04)
+                response = await self.control.post("/", json=heartbeat)
+                self.assertEqual(response.status, 200)
+                await self.service.expire_stalled_transfers()
+                self.assertEqual(self.service.transfers[key]["state"], "transferring")
+                self.assertEqual(self.service.transfers[key]["bytes"], 0)
+
+            await asyncio.sleep(0.14)
+            await self.service.expire_stalled_transfers()
+
+        self.assertEqual(self.service.transfers[key]["state"], "failed")
+        self.assertNotIn(key, self.service.airdrop_progress)
+
+    async def test_invalid_airdrop_progress_does_not_reset_idle_watchdog(self):
+        for invalid in ("wrong-token", "malformed"):
+            with self.subTest(invalid=invalid):
+                task = asyncio.create_task(self.control.post("/", json={
+                    "command": "receive-request", "peer": "Test Mac",
+                    "files": [{"name": "large.zip", "size": 10}],
+                }))
+                for _ in range(100):
+                    if self.service.incoming:
+                        break
+                    await asyncio.sleep(0.01)
+                key = next(iter(self.service.incoming))
+                await self.control.post("/", json={"command": "accept", "id": key})
+                approval = await (await task).json()
+                packet = {
+                    "command": "receive-progress", "id": key,
+                    "token": approval["token"], "bytes": 0,
+                    "state": "transferring",
+                }
+                if invalid == "wrong-token":
+                    packet["token"] = "invalid"
+                else:
+                    packet["state"] = "extracting"
+
+                with patch.object(omadrop, "TRANSFER_IDLE_TIMEOUT", 0.2):
+                    await self.service.expire_stalled_transfers()
+                    await asyncio.sleep(0.12)
+                    response = await self.control.post("/", json=packet)
+                    self.assertEqual(response.status, 400)
+                    await asyncio.sleep(0.1)
+                    await self.service.expire_stalled_transfers()
+
+                self.assertEqual(self.service.transfers[key]["state"], "failed")
+                self.assertNotIn(key, self.service.airdrop_progress)
+
     async def test_cancel_airdrop_revokes_progress_and_receiver_poll_is_rejected(self):
         request = asyncio.create_task(self.control.post("/", json={
             "command": "receive-request", "peer": "Test Mac",
@@ -1141,13 +1209,13 @@ class LocalSendTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.status, 200)
         return await result.json()
 
-    async def upload(self, session, content, token=None):
+    async def upload(self, session, content, token=None, file_id="file"):
         return await self.client.post(
             self.url + "/upload",
             params={
                 "sessionId": session["sessionId"],
-                "fileId": "file",
-                "token": token or session["files"]["file"],
+                "fileId": file_id,
+                "token": token or session["files"][file_id],
             },
             data=content,
         )
@@ -1265,6 +1333,108 @@ class LocalSendTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.upload(session, b"hello", "wrong")).status, 403)
         self.assertEqual((await self.upload(session, b"hello")).status, 422)
         self.assertFalse((self.directory / "test.txt").exists())
+        self.assertNotIn(request_id, self.service.sessions)
+
+    async def test_failed_localsend_uploads_release_slots_and_partial_files(self):
+        self.directory.mkdir(exist_ok=True)
+        unrelated = self.directory / "unrelated.txt"
+        unrelated.write_bytes(b"keep")
+        failure_kinds = ("checksum", "truncated", "oversized", "idle")
+
+        for index in range(20):
+            kind = failure_kinds[index % len(failure_kinds)]
+            checksum = "0" * 64 if kind == "checksum" else None
+            task, request_id = await self.prepare(content=b"hello", checksum=checksum)
+            session = await self.approve(task, request_id)
+
+            if kind == "checksum":
+                response = await self.upload(session, b"hello")
+                expected_status = 422
+            elif kind == "truncated":
+                response = await self.upload(session, b"he")
+                expected_status = 422
+            elif kind == "oversized":
+                response = await self.upload(session, b"hello!")
+                expected_status = 400
+            else:
+                async def stalled_chunks():
+                    yield b"he"
+                    await asyncio.sleep(0.04)
+                    yield b"llo"
+
+                with patch.object(omadrop, "LOCALSEND_UPLOAD_IDLE_TIMEOUT", 0.01):
+                    response = await self.upload(session, stalled_chunks())
+                expected_status = 408
+
+            self.assertEqual(response.status, expected_status, kind)
+            self.assertNotIn(request_id, self.service.sessions, kind)
+            self.assertEqual(self.service.transfers[request_id]["state"], "failed", kind)
+            self.assertFalse(list(self.directory.glob(".omadrop-*.part")), kind)
+
+        task, request_id = await self.prepare()
+        session = await self.approve(task, request_id)
+        response = await self.upload(session, b"hello")
+        self.assertEqual(response.status, 200)
+        self.assertEqual((self.directory / "test.txt").read_bytes(), b"hello")
+        self.assertEqual(unrelated.read_bytes(), b"keep")
+
+    async def test_localsend_failure_cancels_concurrent_files_without_overwriting_failure(self):
+        metadata = {
+            "bad": {
+                "id": "bad", "fileName": "bad.txt", "size": 4,
+                "fileType": "text/plain", "sha256": "0" * 64,
+            },
+            "good": {
+                "id": "good", "fileName": "good.txt", "size": 5,
+                "fileType": "text/plain", "sha256": hashlib.sha256(b"hello").hexdigest(),
+            },
+        }
+        task = asyncio.create_task(self.client.post(
+            self.url + "/prepare-upload",
+            json={"info": {"alias": "Test sender"}, "files": metadata},
+        ))
+        for _ in range(100):
+            if self.service.incoming:
+                break
+            await asyncio.sleep(0.01)
+        self.assertTrue(self.service.incoming)
+        request_id = next(iter(self.service.incoming))
+        session = await self.approve(task, request_id)
+        first_chunk = asyncio.Event()
+        continue_upload = asyncio.Event()
+
+        async def slow_good_file():
+            yield b"he"
+            first_chunk.set()
+            await continue_upload.wait()
+            yield b"llo"
+
+        good_upload = asyncio.create_task(
+            self.upload(session, slow_good_file(), file_id="good")
+        )
+        try:
+            await asyncio.wait_for(first_chunk.wait(), 2)
+            for _ in range(100):
+                if list(self.directory.glob(".omadrop-*.part")):
+                    break
+                await asyncio.sleep(0.01)
+            self.assertEqual(len(list(self.directory.glob(".omadrop-*.part"))), 1)
+            bad_response = await self.upload(session, b"bad!", file_id="bad")
+            self.assertEqual(bad_response.status, 422)
+            self.assertNotIn(request_id, self.service.sessions)
+            self.assertEqual(self.service.transfers[request_id]["state"], "failed")
+            first_error = self.service.transfers[request_id]["error"]
+            self.assertTrue(first_error)
+        finally:
+            continue_upload.set()
+
+        good_response = await asyncio.wait_for(good_upload, 3)
+        self.assertEqual(good_response.status, 403)
+        self.assertEqual(self.service.transfers[request_id]["state"], "failed")
+        self.assertEqual(self.service.transfers[request_id]["error"], first_error)
+        self.assertFalse((self.directory / "bad.txt").exists())
+        self.assertFalse((self.directory / "good.txt").exists())
+        self.assertFalse(list(self.directory.glob(".omadrop-*.part")))
 
     async def test_path_traversal_and_invalid_size(self):
         for name, size in (

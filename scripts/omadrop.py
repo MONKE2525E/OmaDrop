@@ -986,6 +986,8 @@ class Coordinator:
                 entry["sha256"] and digest.hexdigest() != entry["sha256"]
             ):
                 raise web.HTTPUnprocessableEntity(text="Size or checksum mismatch")
+            if session["cancelled"]:
+                raise web.HTTPForbidden(text="Cancelled")
             # Hard linking is atomic and never overwrites a pre-existing file.
             for suffix in range(1000):
                 path = Path(entry["name"])
@@ -1006,10 +1008,13 @@ class Coordinator:
             return web.Response()
         except BaseException as error:
             entry["state"] = "failed"
-            transfer.update(
-                state="cancelled" if session["cancelled"] else "failed",
-                error=str(error)[:200],
-            )
+            if not session["cancelled"]:
+                session["cancelled"] = True
+                self.sessions.pop(session_id, None)
+                if transfer["state"] in ACTIVE_STATES:
+                    transfer.update(state="failed", error=str(error)[:200])
+            elif transfer["state"] in ACTIVE_STATES:
+                transfer.update(state="cancelled", error=str(error)[:200])
             raise
         finally:
             temporary.unlink(missing_ok=True)
@@ -1592,6 +1597,7 @@ class Coordinator:
                 state="failed",
                 error="Transfer timed out after 5 minutes without progress",
             )
+            self.airdrop_progress.pop(key, None)
             cleanup_sent_files(self.outgoing_files.pop(key, []))
             self.transfer_watch.pop(key, None)
 
@@ -1805,6 +1811,9 @@ class Coordinator:
                     raise ValueError("Receive session finished")
                 if state not in ("transferring", "complete", "failed") or type(count) is not int or not transfer["bytes"] <= count <= transfer["total"]:
                     raise ValueError("Invalid receive progress")
+                # The AirDrop receiver reports authenticated request-body
+                # activity before archive extraction can produce byte progress.
+                self.transfer_watch[key] = ((state, count), time.monotonic())
                 if state == "complete" and grant.get("urls"):
                     # Consume before launching: a repeated progress packet cannot reopen tabs.
                     urls = grant.pop("urls")
