@@ -61,6 +61,380 @@ class LocalSendTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(marker.exists())
         self.service.peers.pop("airdrop:test")
 
+    async def test_airdrop_send_outlives_no_byte_watchdog_without_fake_progress(self):
+        runtime = Path(self.temp.name) / "runtime"
+        runtime.mkdir(mode=0o700)
+        stage_dir = runtime / "clipboard" / "clipboard-airdrop"
+        unrelated_dir = runtime / "clipboard" / "clipboard-unrelated"
+        stage_dir.mkdir(parents=True)
+        unrelated_dir.mkdir()
+        original = Path(self.temp.name) / "original.bin"
+        staged = stage_dir / "clipboard.bin"
+        unrelated = unrelated_dir / "keep.bin"
+        original.write_bytes(b"original")
+        staged.write_bytes(b"staged")
+        unrelated.write_bytes(b"unrelated")
+
+        bin_dir = Path(self.temp.name) / "bin"
+        bin_dir.mkdir()
+        arguments = Path(self.temp.name) / "arguments"
+        executable = bin_dir / "omdrop"
+        executable.write_text(
+            f"#!{sys.executable}\n"
+            "import pathlib,sys,time\n"
+            f"pathlib.Path({str(arguments)!r}).write_text(' '.join(sys.argv[1:]))\n"
+            "for _ in range(12):\n"
+            " print('sender operation active', flush=True)\n"
+            " time.sleep(0.02)\n"
+        )
+        executable.chmod(0o700)
+        peer = {"protocol": "airdrop", "name": "Apple device", "mac": "aa:bb"}
+        key = "airdrop:slow-cli-send"
+        observed_bytes = []
+        run_calls = []
+        real_run_command = omadrop.run_command
+
+        async def record_command(*args, **kwargs):
+            run_calls.append((args, kwargs))
+            return await real_run_command(*args, **kwargs)
+
+        with patch.dict(
+            os.environ,
+            {
+                "PATH": str(bin_dir) + os.pathsep + os.environ["PATH"],
+                "OMADROP_RUNTIME_DIR": str(runtime),
+            },
+        ), patch.object(omadrop, "TRANSFER_IDLE_TIMEOUT", 0.05), patch.object(
+            omadrop, "run_command", new=record_command
+        ):
+            started = time.monotonic()
+            sending = self.service.spawn(
+                self.service.send_files(peer, [str(original), str(staged)], key)
+            )
+            sending.set_name(key)
+
+            async def monitor():
+                while not sending.done():
+                    await asyncio.sleep(0.01)
+                    await self.service.expire_stalled_transfers()
+                    if self.service.transfers[key]["state"] in omadrop.ACTIVE_STATES:
+                        observed_bytes.append(self.service.transfers[key]["bytes"])
+
+            monitoring = asyncio.create_task(monitor())
+            try:
+                await asyncio.wait_for(sending, 3)
+            finally:
+                monitoring.cancel()
+                await asyncio.gather(monitoring, return_exceptions=True)
+
+        self.assertGreater(time.monotonic() - started, 0.05)
+        self.assertTrue(observed_bytes)
+        self.assertEqual(set(observed_bytes), {0})
+        self.assertEqual(len(run_calls), 1)
+        self.assertIsNone(run_calls[0][1]["timeout"])
+        self.assertIn("--wait 30 --to aa:bb", arguments.read_text())
+        self.assertEqual(self.service.transfers[key]["state"], "complete")
+        self.assertEqual(self.service.transfers[key]["bytes"], original.stat().st_size + 6)
+        self.assertTrue(original.exists())
+        self.assertFalse(staged.exists())
+        self.assertTrue(unrelated.exists())
+
+    async def test_cancel_airdrop_cli_send_stops_process_and_cleans_staged_input(self):
+        runtime = Path(self.temp.name) / "runtime"
+        runtime.mkdir(mode=0o700)
+        stage_dir = runtime / "clipboard" / "clipboard-airdrop-cancel"
+        unrelated_dir = runtime / "clipboard" / "clipboard-unrelated"
+        stage_dir.mkdir(parents=True)
+        unrelated_dir.mkdir()
+        original = Path(self.temp.name) / "original.bin"
+        staged = stage_dir / "clipboard.bin"
+        unrelated = unrelated_dir / "keep.bin"
+        original.write_bytes(b"original")
+        staged.write_bytes(b"staged")
+        unrelated.write_bytes(b"unrelated")
+
+        bin_dir = Path(self.temp.name) / "bin"
+        bin_dir.mkdir()
+        child_pid_file = Path(self.temp.name) / "child.pid"
+        executable = bin_dir / "omdrop"
+        executable.write_text(
+            f"#!{sys.executable}\n"
+            "import pathlib,signal,subprocess,sys,time\n"
+            "child=None\n"
+            "def stop(signum, frame):\n"
+            " try: child.terminate()\n"
+            " except ProcessLookupError: pass\n"
+            " try: child.wait(timeout=2)\n"
+            " except subprocess.TimeoutExpired:\n"
+            "  child.kill(); child.wait()\n"
+            " raise SystemExit(128 + signum)\n"
+            "signal.signal(signal.SIGTERM, stop)\n"
+            "child=subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+            f"pathlib.Path({str(child_pid_file)!r}).write_text(str(child.pid))\n"
+            "while True: time.sleep(0.1)\n"
+        )
+        executable.chmod(0o700)
+        peer = {"protocol": "airdrop", "name": "Apple device", "mac": "aa:bb"}
+        key = "airdrop:cancel-cli-send"
+
+        with patch.dict(
+            os.environ,
+            {
+                "PATH": str(bin_dir) + os.pathsep + os.environ["PATH"],
+                "OMADROP_RUNTIME_DIR": str(runtime),
+            },
+        ):
+            sending = self.service.spawn(
+                self.service.send_files(peer, [str(original), str(staged)], key)
+            )
+            sending.set_name(key)
+            for _ in range(200):
+                if child_pid_file.exists():
+                    break
+                await asyncio.sleep(0.01)
+            self.assertTrue(child_pid_file.exists())
+            response = await self.control.post(
+                "/", json={"command": "cancel", "id": key}
+            )
+            self.assertEqual(response.status, 200)
+            self.assertTrue(sending.done())
+
+        child_pid = int(child_pid_file.read_text())
+        for _ in range(100):
+            try:
+                os.kill(child_pid, 0)
+            except ProcessLookupError:
+                break
+            await asyncio.sleep(0.01)
+        else:
+            self.fail("AirDrop sender child survived cancellation")
+        self.assertEqual(self.service.transfers[key]["state"], "cancelled")
+        self.assertNotIn(key, self.service.outgoing_files)
+        self.assertTrue(original.exists())
+        self.assertFalse(staged.exists())
+        self.assertTrue(unrelated.exists())
+
+    async def test_quickshare_eof_waits_for_process_exit_before_cleaning_cancelled_inputs(self):
+        runtime = Path(self.temp.name) / "runtime"
+        runtime.mkdir(mode=0o700)
+        stage_dir = runtime / "clipboard" / "clipboard-quick-cancel"
+        unrelated_dir = runtime / "clipboard" / "clipboard-unrelated"
+        stage_dir.mkdir(parents=True)
+        unrelated_dir.mkdir()
+        original = Path(self.temp.name) / "original.bin"
+        staged = stage_dir / "clipboard.bin"
+        unrelated = unrelated_dir / "keep.bin"
+        original.write_bytes(b"original")
+        staged.write_bytes(b"staged")
+        unrelated.write_bytes(b"unrelated")
+        bridge_staging = Path(self.temp.name) / "quickshare-staging"
+        bridge_staging.mkdir()
+        release = Path(self.temp.name) / "bridge-exit"
+        peer = {
+            "protocol": "quickshare",
+            "name": "Test phone",
+            "host": "127.0.0.1",
+            "port": 12345,
+        }
+        key = "quickshare:eof-cancel"
+
+        process = await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-c",
+            "import os,pathlib,sys,time; os.close(1); release=pathlib.Path(sys.argv[1]); "
+            "exec('while not release.exists(): time.sleep(0.01)')",
+            str(release),
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
+        )
+        self.service.quick = process
+        self.service.quick_staging = bridge_staging
+        self.service.quick_process_staging[id(process)] = bridge_staging
+        self.service.transfers[key] = self.service.outgoing_transfer(
+            peer, [str(original), str(staged)], key
+        )
+        self.service.transfers[key]["state"] = "transferring"
+        self.service.outgoing_files[key] = [str(original), str(staged)]
+        self.service.quick_transfer_processes[key] = process
+        with patch.dict(os.environ, {"OMADROP_RUNTIME_DIR": str(runtime)}):
+            events = self.service.spawn(self.service.quick_events(process))
+            await asyncio.wait_for(events, 2)
+            self.assertIsNone(process.returncode)
+            self.assertTrue(staged.exists())
+            response = await self.control.post(
+                "/", json={"command": "cancel", "id": key}
+            )
+            self.assertEqual(response.status, 200)
+            self.assertEqual(self.service.transfers[key]["state"], "cancelled")
+            self.assertTrue(staged.exists())
+            release.touch()
+            watcher = self.service.quick_exit_watchers[id(process)]
+            await asyncio.wait_for(watcher, 2)
+
+        self.assertEqual(self.service.transfers[key]["state"], "cancelled")
+        self.assertNotIn(key, self.service.outgoing_files)
+        self.assertTrue(original.exists())
+        self.assertFalse(staged.exists())
+        self.assertTrue(unrelated.exists())
+
+    async def test_quickshare_bridge_exit_retires_pending_incoming_approval(self):
+        self.directory.mkdir()
+        staging = Path(self.temp.name) / "quickshare-incoming"
+        staging.mkdir()
+        partial = staging / "incoming.bin"
+        partial.write_bytes(b"partial")
+        process = type("ExitedProcess", (), {"returncode": 0, "pid": 1})()
+        self.service.quick = process
+        self.service.quick_staging = staging
+        self.service.quick_process_staging[id(process)] = staging
+        metadata = {"source": {"name": "Test phone"}, "files": [partial.name], "total_bytes": 7}
+        self.service.quick_transfer(
+            {
+                "id": "pending-on-exit",
+                "rtype": "Inbound",
+                "state": "WaitingForUserConsent",
+                "meta": metadata,
+            },
+            process=process,
+        )
+        key = "quickshare:pending-on-exit"
+        decision = asyncio.get_running_loop().create_future()
+        self.service.incoming[key]["decision"] = decision
+        self.service.quick_active = key
+
+        self.service.quick_process_exited(process)
+
+        self.assertTrue(decision.done())
+        self.assertFalse(decision.result())
+        self.assertNotIn(key, self.service.incoming)
+        self.assertEqual(self.service.transfers[key]["state"], "failed")
+        self.assertFalse(partial.exists())
+        self.assertFalse(staging.exists())
+        self.assertIsNone(self.service.quick_active)
+
+    async def test_quickshare_bridge_exit_preserves_independent_publication(self):
+        self.directory.mkdir()
+        staging = Path(self.temp.name) / "quickshare-publishing"
+        staging.mkdir()
+        source = staging / "large.bin"
+        expected = b"x" * (1024 * 1024)
+        source.write_bytes(expected)
+        process = type("ExitedProcess", (), {"returncode": 0, "pid": 1})()
+        self.service.quick = process
+        self.service.quick_staging = staging
+        self.service.quick_process_staging[id(process)] = staging
+        metadata = {
+            "source": {"name": "Test phone"},
+            "files": [source.name],
+            "total_bytes": source.stat().st_size,
+        }
+        self.service.quick_transfer(
+            {
+                "id": "publish-on-exit",
+                "rtype": "Inbound",
+                "state": "WaitingForUserConsent",
+                "meta": metadata,
+            },
+            process=process,
+        )
+        key = "quickshare:publish-on-exit"
+        self.service.quick_active = key
+        entered_copy = asyncio.Event()
+        continue_copy = asyncio.Event()
+
+        async def block_copy():
+            entered_copy.set()
+            await continue_copy.wait()
+
+        with patch.object(self.service, "quick_publication_checkpoint", new=block_copy):
+            self.service.quick_transfer(
+                {
+                    "id": "publish-on-exit",
+                    "rtype": "Inbound",
+                    "state": "Finished",
+                    "meta": metadata,
+                },
+                process=process,
+            )
+            publication = self.service.quick_publications[key]
+            await asyncio.wait_for(entered_copy.wait(), 2)
+            self.service.quick_process_exited(process)
+            self.assertFalse(publication.cancelled())
+            self.assertFalse(publication.done())
+            self.assertTrue(source.exists())
+            self.assertEqual(self.service.quick_active, key)
+            continue_copy.set()
+            await asyncio.wait_for(publication, 3)
+
+        self.assertEqual(self.service.transfers[key]["state"], "complete")
+        self.assertEqual((self.directory / source.name).read_bytes(), expected)
+        self.assertFalse(source.exists())
+        self.assertFalse(staging.exists())
+        self.assertIsNone(self.service.quick_active)
+
+    async def test_stale_quickshare_process_exit_does_not_touch_replacement(self):
+        runtime = Path(self.temp.name) / "runtime"
+        runtime.mkdir(mode=0o700)
+        old_stage_dir = runtime / "clipboard" / "clipboard-old-bridge"
+        new_stage_dir = runtime / "clipboard" / "clipboard-new-bridge"
+        old_stage_dir.mkdir(parents=True)
+        new_stage_dir.mkdir()
+        old_original = Path(self.temp.name) / "old-original.bin"
+        old_staged = old_stage_dir / "clipboard.bin"
+        new_original = Path(self.temp.name) / "new-original.bin"
+        new_staged = new_stage_dir / "clipboard.bin"
+        old_original.write_bytes(b"old original")
+        old_staged.write_bytes(b"old staged")
+        new_original.write_bytes(b"new original")
+        new_staged.write_bytes(b"new staged")
+        old_bridge_staging = Path(self.temp.name) / "old-bridge-staging"
+        new_bridge_staging = Path(self.temp.name) / "new-bridge-staging"
+        old_bridge_staging.mkdir()
+        new_bridge_staging.mkdir()
+        old_process = type("ExitedProcess", (), {"returncode": 0, "pid": 11})()
+        new_process = type("ActiveProcess", (), {"returncode": None, "pid": 12})()
+        self.service.quick = new_process
+        self.service.quick_staging = new_bridge_staging
+        self.service.quick_process_staging[id(old_process)] = old_bridge_staging
+        self.service.quick_process_staging[id(new_process)] = new_bridge_staging
+        self.service.channel("quickshare", "advertising")
+        self.service.peers["quickshare:new-peer"] = {"id": "quickshare:new-peer"}
+        old_key = "quickshare:old-send"
+        new_key = "quickshare:new-send"
+        peer = {"protocol": "quickshare", "name": "Test phone"}
+        self.service.transfers[old_key] = self.service.outgoing_transfer(
+            peer, [str(old_original), str(old_staged)], old_key
+        )
+        self.service.transfers[old_key]["state"] = "cancelled"
+        self.service.outgoing_files[old_key] = [str(old_original), str(old_staged)]
+        self.service.quick_transfer_processes[old_key] = old_process
+        self.service.transfers[new_key] = self.service.outgoing_transfer(
+            peer, [str(new_original), str(new_staged)], new_key
+        )
+        self.service.transfers[new_key]["state"] = "transferring"
+        self.service.outgoing_files[new_key] = [str(new_original), str(new_staged)]
+        self.service.quick_transfer_processes[new_key] = new_process
+
+        with patch.dict(os.environ, {"OMADROP_RUNTIME_DIR": str(runtime)}):
+            self.service.quick_process_exited(old_process)
+
+        self.assertIs(self.service.quick, new_process)
+        self.assertEqual(self.service.channels["quickshare"]["state"], "advertising")
+        self.assertIn("quickshare:new-peer", self.service.peers)
+        self.assertNotIn(old_key, self.service.outgoing_files)
+        self.assertFalse(old_staged.exists())
+        self.assertTrue(old_original.exists())
+        self.assertIn(new_key, self.service.outgoing_files)
+        self.assertIs(
+            self.service.quick_transfer_processes[new_key], new_process
+        )
+        self.assertTrue(new_staged.exists())
+        self.assertTrue(new_original.exists())
+        self.assertTrue(new_bridge_staging.exists())
+        self.service.quick = None
+
     async def test_localsend_presents_client_certificate_and_still_pins_peer(self):
         import ssl
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)

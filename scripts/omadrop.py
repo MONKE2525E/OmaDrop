@@ -45,6 +45,8 @@ LOCALSEND_UPLOAD_IDLE_TIMEOUT = 300
 LOCALSEND_RESPONSE_IDLE_TIMEOUT = 300
 LOCALSEND_CHUNK_SIZE = 256 * 1024
 TRANSFER_IDLE_TIMEOUT = 300
+# Keep the receiver-wakeup phase bounded; the sender bounds each HTTP operation.
+AIRDROP_SEND_WAIT = 30
 MAX_MENU_LEASES = 64
 LEGACY_MENU_LEASE_ID = "legacy"
 
@@ -168,16 +170,36 @@ def save_settings(settings):
     temporary.replace(base / "settings.json")
 
 
+async def terminate_process_group(process):
+    with contextlib.suppress(ProcessLookupError):
+        os.killpg(process.pid, signal.SIGTERM)
+    if process.returncode is None:
+        try:
+            await asyncio.wait_for(process.wait(), 3)
+        except TimeoutError:
+            pass
+    try:
+        os.killpg(process.pid, 0)
+    except ProcessLookupError:
+        return
+    else:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(process.pid, signal.SIGKILL)
+        if process.returncode is None:
+            await process.wait()
+
+
 async def run_command(*args, timeout=15, accepted_codes=(0,)):
     process = await asyncio.create_subprocess_exec(
-        *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+        *args,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        start_new_session=True,
     )
     try:
         out, err = await asyncio.wait_for(process.communicate(), timeout)
     except (TimeoutError, asyncio.CancelledError):
-        if process.returncode is None:
-            process.kill()
-        await process.wait()
+        await terminate_process_group(process)
         raise
     if process.returncode not in accepted_codes:
         raise RuntimeError(
@@ -396,7 +418,12 @@ class Coordinator:
         self.quick_files = {}
         self.quick_text = {}
         self.quick_publications = {}
+        self.quick_transfer_processes = {}
+        self.quick_transfer_staging = {}
+        self.quick_process_staging = {}
+        self.quick_exit_watchers = {}
         self.airdrop_progress = {}
+        self.airdrop_sends = set()
         self.airdrop_owned = False
         self.airdrop_names = None
         self.window_timer = None
@@ -443,12 +470,16 @@ class Coordinator:
                 self.quick_active = None
 
     def cleanup_quick_staging(self, key):
-        if self.quick_staging is not None:
+        staging = self.quick_transfer_staging.pop(key, None) or self.quick_staging
+        if staging is not None:
             for filename in self.quick_files.pop(key, []):
                 try:
-                    (self.quick_staging / safe_name(filename)).unlink(missing_ok=True)
+                    (staging / safe_name(filename)).unlink(missing_ok=True)
                 except (OSError, ValueError):
                     pass
+            if staging != self.quick_staging:
+                with contextlib.suppress(OSError):
+                    staging.rmdir()
         self.quick_text.pop(key, None)
 
     async def quick_publication_checkpoint(self):
@@ -580,22 +611,32 @@ class Coordinator:
             task.cancel()
         await asyncio.gather(*list(self.tasks), return_exceptions=True)
         if self.quick and self.quick.returncode is None:
-            self.quick.terminate()
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(self.quick.pid, signal.SIGTERM)
             try:
                 await asyncio.wait_for(self.quick.wait(), 8)
             except TimeoutError:
-                self.quick.kill()
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(self.quick.pid, signal.SIGKILL)
                 await self.quick.wait()
         self.quick = None
         for files in self.outgoing_files.values():
             cleanup_sent_files(files)
         self.outgoing_files.clear()
+        staging_dirs = set(self.quick_transfer_staging.values())
         if self.quick_staging:
-            shutil.rmtree(self.quick_staging, ignore_errors=True)
-            self.quick_staging = None
+            staging_dirs.add(self.quick_staging)
+        for staging in staging_dirs:
+            shutil.rmtree(staging, ignore_errors=True)
+        self.quick_staging = None
         self.quick_active = None
         self.quick_files.clear()
         self.quick_text.clear()
+        self.quick_transfer_processes.clear()
+        self.quick_transfer_staging.clear()
+        self.quick_process_staging.clear()
+        self.quick_exit_watchers.clear()
+        self.airdrop_sends.clear()
         self.airdrop_progress.clear()
         if self.udp:
             self.udp.close()
@@ -997,6 +1038,10 @@ class Coordinator:
     async def start_quick(self):
         if not os.access(self.quick_path, os.X_OK):
             raise RuntimeError("Quick Share bridge is not installed")
+        if self.quick is not None:
+            if self.quick.returncode is None:
+                return
+            self.quick_process_exited(self.quick)
         Path(self.settings["directory"]).mkdir(parents=True, exist_ok=True)
         # The engine writes only into private staging. Validate remote names
         # before consent, then publish completed files without overwriting.
@@ -1010,24 +1055,41 @@ class Coordinator:
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
         )
+        process = self.quick
+        self.quick_process_staging[id(process)] = self.quick_staging
         try:
-            first = await asyncio.wait_for(self.quick.stdout.readline(), 15)
+            first = await asyncio.wait_for(process.stdout.readline(), 15)
             if not first or json.loads(first).get("event") != "ready":
                 raise RuntimeError("Quick Share engine could not start")
         except BaseException:
-            if self.quick.returncode is None:
-                self.quick.kill()
-            await self.quick.wait()
-            self.quick = None
+            if process.returncode is None:
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(process.pid, signal.SIGTERM)
+                try:
+                    await asyncio.wait_for(process.wait(), 3)
+                except TimeoutError:
+                    with contextlib.suppress(ProcessLookupError):
+                        os.killpg(process.pid, signal.SIGKILL)
+                    await process.wait()
+            staging = self.quick_process_staging.pop(id(process), None)
+            if self.quick is process:
+                self.quick = None
+                if self.quick_staging == staging:
+                    self.quick_staging = None
+            if staging is not None:
+                shutil.rmtree(staging, ignore_errors=True)
             raise
         self.channel("quickshare", "advertising")
-        self.spawn(self.quick_events())
-        self.spawn(self.quick_errors())
+        self.watch_quick_process_exit(process)
+        self.spawn(self.quick_events(process))
+        self.spawn(self.quick_errors(process))
 
-    async def quick_errors(self):
+    async def quick_errors(self, process=None):
         # Drain stderr so diagnostics cannot block the protocol process.
-        while self.quick and await self.quick.stderr.readline():
+        process = process or self.quick
+        while process and self.quick is process and await process.stderr.readline():
             pass
 
     async def quick_write(self, message):
@@ -1046,13 +1108,96 @@ class Coordinator:
             return False
         return True
 
-    async def quick_events(self):
-        while self.quick:
-            line = await self.quick.stdout.readline()
+    def watch_quick_process_exit(self, process):
+        watcher = self.quick_exit_watchers.get(id(process))
+        if watcher is not None and not watcher.done():
+            return watcher
+        watcher = self.spawn(self.wait_quick_process_exit(process))
+        watcher.set_name(f"quick-exit:{process.pid}")
+        self.quick_exit_watchers[id(process)] = watcher
+        watcher.add_done_callback(
+            lambda task, process_id=id(process): self.quick_exit_watchers.pop(
+                process_id, None
+            )
+            if self.quick_exit_watchers.get(process_id) is task
+            else None
+        )
+        return watcher
+
+    async def wait_quick_process_exit(self, process):
+        waiter = asyncio.create_task(process.wait())
+        try:
+            while process.returncode is None and self.running:
+                done, _ = await asyncio.wait({waiter}, timeout=0.25)
+                if done:
+                    break
+            if process.returncode is not None:
+                self.quick_process_exited(process)
+        finally:
+            if not waiter.done():
+                waiter.cancel()
+                await asyncio.gather(waiter, return_exceptions=True)
+
+    def quick_process_exited(self, process):
+        if process.returncode is None:
+            return
+        staging = self.quick_process_staging.pop(id(process), None)
+        if self.quick is process:
+            self.quick = None
+            if self.quick_staging == staging:
+                self.quick_staging = None
+            self.channel("quickshare", "unavailable", "Quick Share engine stopped")
+            for key in [k for k in self.peers if k.startswith("quickshare:")]:
+                self.peers.pop(key, None)
+
+        for key, owner in list(self.quick_transfer_processes.items()):
+            if owner is not process:
+                continue
+            transfer = self.transfers.get(key)
+            if transfer and transfer.get("direction") == "out":
+                if transfer.get("state") in ACTIVE_STATES:
+                    transfer.update(
+                        state="failed", error="Quick Share engine stopped"
+                    )
+                cleanup_sent_files(self.outgoing_files.pop(key, []))
+                self.transfer_watch.pop(key, None)
+            else:
+                pending = self.incoming.pop(key, None)
+                if pending:
+                    decision = pending.get("decision")
+                    if decision is not None and not decision.done():
+                        decision.set_result(False)
+                publication = self.quick_publications.get(key)
+                if publication is not None and not publication.done():
+                    self.quick_transfer_processes.pop(key, None)
+                    continue
+                if transfer and transfer.get("state") in ACTIVE_STATES:
+                    transfer.update(
+                        state="failed", error="Quick Share engine stopped"
+                    )
+                self.cleanup_quick_staging(key)
+                if self.quick_active == key:
+                    self.quick_active = None
+            self.quick_transfer_processes.pop(key, None)
+
+        if staging is not None and staging != self.quick_staging:
+            with contextlib.suppress(OSError):
+                staging.rmdir()
+
+    async def quick_events(self, process=None):
+        process = process or self.quick
+        while process and self.quick is process:
+            line = await process.stdout.readline()
             if not line:
-                self.channel("quickshare", "unavailable", "Quick Share engine stopped")
-                for key in [k for k in self.peers if k.startswith("quickshare:")]:
-                    self.peers.pop(key)
+                if self.quick is process:
+                    self.channel(
+                        "quickshare", "unavailable", "Quick Share engine stopped"
+                    )
+                    for key in [k for k in self.peers if k.startswith("quickshare:")]:
+                        self.peers.pop(key, None)
+                self.watch_quick_process_exit(process)
+                break
+            if self.quick is not process:
                 break
             try:
                 event = json.loads(line)
@@ -1080,7 +1225,7 @@ class Coordinator:
                             "direction": data.get("rtype"), "files": len(meta.get("files") or []),
                             "textType": meta.get("text_type"), "hasTextTitle": meta.get("text_description") is not None}),
                             file=sys.stderr, flush=True)
-                    self.quick_transfer(data)
+                    self.quick_transfer(data, process=process)
                 elif event["event"] == "diagnostic":
                     print("Quick Share diagnostic: " + json.dumps({k: event[k] for k in ("phase", "file", "line") if k in event}),
                           file=sys.stderr, flush=True)
@@ -1089,10 +1234,14 @@ class Coordinator:
             except (KeyError, TypeError, ValueError):
                 continue
 
-    def quick_transfer(self, data):
+    def quick_transfer(self, data, process=None):
         key = "quickshare:" + data["id"]
+        if process is not None:
+            self.quick_transfer_processes[key] = process
         metadata = data.get("meta") or {}
         inbound = data.get("rtype") == "Inbound"
+        if inbound and self.quick_staging is not None:
+            self.quick_transfer_staging.setdefault(key, self.quick_staging)
         name = (
             (metadata.get("source") or {}).get("name")
             or metadata.get("destination")
@@ -1204,6 +1353,13 @@ class Coordinator:
         self.transfers[key] = previous
         if not inbound and mapped not in ACTIVE_STATES:
             cleanup_sent_files(self.outgoing_files.pop(key, []))
+            self.quick_transfer_processes.pop(key, None)
+        elif (
+            inbound
+            and state in ("Cancelled", "Rejected", "Disconnected")
+            and not publication_running
+        ):
+            self.quick_transfer_processes.pop(key, None)
         if inbound and state == "Finished" and not was_cancelled:
             self.transfers[key]["publishing"] = True
         elif inbound and publication_running:
@@ -1213,6 +1369,7 @@ class Coordinator:
 
     async def publish_quick_files(self, key):
         transfer = self.transfers[key]
+        staging = self.quick_transfer_staging.get(key) or self.quick_staging
         try:
             if transfer.get("state") == "cancelled":
                 raise asyncio.CancelledError
@@ -1229,14 +1386,14 @@ class Coordinator:
                     self.quick_files.pop(key, None)
                     return
                 filename = transfer["fileName"]
-                path = self.quick_staging / filename
+                path = staging / filename
                 with path.open("xb") as output:
                     path.chmod(0o600)
                     output.write(payload.encode("utf-8"))
                 self.quick_files[key] = [filename]
                 transfer.update(bytes=len(payload.encode()), total=len(payload.encode()))
             for filename in self.quick_files.get(key, []):
-                source_path = self.quick_staging / safe_name(filename)
+                source_path = staging / safe_name(filename)
                 temporary = folder / (".omadrop-" + secrets.token_hex(16) + ".part")
                 try:
                     descriptor = os.open(source_path, os.O_RDONLY | os.O_NOFOLLOW)
@@ -1287,6 +1444,8 @@ class Coordinator:
             transfer.pop("publishing", None)
             if self.quick_active == key:
                 self.quick_active = None
+            self.cleanup_quick_staging(key)
+            self.quick_transfer_processes.pop(key, None)
 
     async def start_airdrop(self):
         if not shutil.which("omdrop"):
@@ -1405,6 +1564,12 @@ class Coordinator:
             if transfer["state"] not in ACTIVE_STATES:
                 self.transfer_watch.pop(key, None)
                 continue
+            # The pinned AirDrop CLI exposes phase completion, not byte
+            # progress. Its socket operations have their own inactivity
+            # timeouts, and the send task remains explicitly cancellable.
+            if key in self.airdrop_sends:
+                self.transfer_watch.pop(key, None)
+                continue
             progress = (transfer["state"], transfer.get("bytes", 0))
             previous, last_progress = self.transfer_watch.get(key, (progress, now))
             if previous != progress:
@@ -1471,6 +1636,9 @@ class Coordinator:
         quick_dispatched = False
         try:
             if peer["protocol"] == "quickshare":
+                quick_process = self.quick
+                if quick_process is not None:
+                    self.quick_transfer_processes[transfer_id] = quick_process
                 await self.quick_write(
                     {
                         "action": "send",
@@ -1484,9 +1652,20 @@ class Coordinator:
                 return
             if peer["protocol"] == "airdrop":
                 transfer["state"] = "transferring"
-                await run_command(
-                    "omdrop", "send", "--to", peer["mac"], *files, timeout=300
-                )
+                self.airdrop_sends.add(transfer_id)
+                try:
+                    await run_command(
+                        "omdrop",
+                        "send",
+                        "--wait",
+                        str(AIRDROP_SEND_WAIT),
+                        "--to",
+                        peer["mac"],
+                        *files,
+                        timeout=None,
+                    )
+                finally:
+                    self.airdrop_sends.discard(transfer_id)
                 transfer.update(state="complete", bytes=total)
                 return
             metadata = {
@@ -1556,6 +1735,8 @@ class Coordinator:
             if peer["protocol"] != "quickshare" or not quick_dispatched:
                 cleanup_sent_files(files)
                 self.outgoing_files.pop(transfer_id, None)
+                if peer["protocol"] == "quickshare":
+                    self.quick_transfer_processes.pop(transfer_id, None)
 
     async def local_send_chunks(self, path, transfer):
         with path.open("rb") as source:
