@@ -36,6 +36,8 @@ systemctl --user enable omadrop.service
 # The protocol engine is absent when visibility is off; permit LAN clients only.
 if command -v ufw >/dev/null && sudo ufw status | rg -q '^Status: active'; then
   for network in 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16; do
+    sudo ufw allow from "$network" to any port 53317 proto tcp comment 'OmaDrop LocalSend LAN'
+    sudo ufw allow from "$network" to any port 53317 proto udp comment 'OmaDrop LocalSend LAN'
     sudo ufw allow from "$network" to any port 53318 proto tcp comment 'OmaDrop Quick Share LAN'
   done
 fi

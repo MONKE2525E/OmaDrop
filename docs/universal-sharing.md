@@ -38,6 +38,9 @@ It does not replace the existing `omdrop` CLI or change Wi-Fi drivers.
 | Quick Share | Pinned RQuickShare library through a native JSON-lines bridge | Same LAN with mDNS and TCP 53318 permitted; Bluetooth wake when BlueZ permits it; files and shared text/URLs |
 | AirDrop | Pinned `omdrop` receiver and OWL AWDL radio backend | `tools/install-airdrop.sh`; shared radio mode is verified on MT7925 |
 
+When UFW is active, the installer permits LocalSend TCP/UDP 53317 and Quick
+Share TCP 53318 from RFC1918 LAN ranges only.
+
 LocalSend uses a persistent self-signed certificate. Outbound HTTPS checks the
 certificate against the fingerprint announced by the peer. That is a
 consistency check, not an authenticated identity or trusted-sender list.
