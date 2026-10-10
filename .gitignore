@@ -7,6 +7,10 @@
 /googletest/
 /radiotap/
 /omdrop-awdl/
+/hostapd-*.tar.gz
 /src/
 /pkg/
 /*.pkg.tar.*
+/quickshare/target/
+__pycache__/
+*.pyc

@@ -9,11 +9,11 @@ arch=('x86_64' 'aarch64')
 url="https://github.com/t4t5/omdrop-owl"
 # OWL (and our patches to it) GPL-3.0-or-later; its bundled radiotap parser
 # ISC; omdrop-awdl's tools GPL-2.0-only. They ship as separate programs.
-license=('GPL-3.0-or-later' 'GPL-2.0-only' 'ISC')
+license=('GPL-3.0-or-later' 'GPL-2.0-only' 'ISC' 'BSD-3-Clause')
 depends=('bash' 'python' 'iproute2' 'iputils' 'iw' 'polkit' 'util-linux' 'procps-ng'
          'libpcap' 'libev' 'libnl' 'networkmanager' 'keyutils'
          'python-libarchive-c' 'python-pillow' 'python-zeroconf' 'python-ifaddr'
-         'bluez' 'python-dbus' 'python-gobject')
+         'bluez' 'python-dbus' 'python-gobject' 'openssl')
 makedepends=('git' 'cmake' 'gcc')
 # Both own /usr/lib/omdrop: one radio backend at a time.
 conflicts=('brcmfmac-awdl-dkms')
@@ -25,8 +25,9 @@ _omdrop_awdl_commit=534f91a525337951ca19c311e53d333bd6d55100
 source=("owl::git+https://github.com/jedbillyb/owl.git#commit=${_owl_commit}"
         "googletest::git+https://github.com/google/googletest.git"
         "radiotap::git+https://github.com/radiotap/radiotap-library.git"
-        "omdrop-awdl::git+https://github.com/brentkearney/omdrop-awdl.git#commit=${_omdrop_awdl_commit}")
-sha256sums=('SKIP' 'SKIP' 'SKIP' 'SKIP')
+        "omdrop-awdl::git+https://github.com/brentkearney/omdrop-awdl.git#commit=${_omdrop_awdl_commit}"
+        'https://w1.fi/releases/hostapd-2.11.tar.gz')
+sha256sums=('SKIP' 'SKIP' 'SKIP' 'SKIP' '2b3facb632fd4f65e32f4bf82a76b4b72c501f995a4f62e330219fe7aed1747a')
 
 # omdrop-awdl's radio-independent tools, installed unmodified beside our
 # helper: send-to-peer finds the helper, the sender and the BLE advertiser
@@ -51,6 +52,10 @@ prepare() {
     msg2 "applying ${p##*/}"
     git apply "$p"
   done
+  cd "${srcdir}/hostapd-2.11"
+  patch -p1 < "${startdir}/patches/hostapd-p2p-go.patch"
+  cp hostapd/defconfig hostapd/.config
+  sed -i 's/^#CONFIG_LIBNL32=y/CONFIG_LIBNL32=y/' hostapd/.config
 }
 
 build() {
@@ -59,6 +64,7 @@ build() {
   # target is built: googletest fails under current GCC and isn't needed.
   cmake -S owl -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_POLICY_VERSION_MINIMUM=3.5 -Wno-dev
   cmake --build build --target owl
+  make -C hostapd-2.11/hostapd
 }
 
 check() {
@@ -71,7 +77,10 @@ package() {
   local lib="${pkgdir}/usr/lib/omdrop" f
   install -Dm755 "${startdir}/userspace/omdrop-discoverable" "${lib}/omdrop-discoverable"
   install -Dm644 "${startdir}/userspace/owl-profiles" "${lib}/owl-profiles"
+  install -Dm755 "${startdir}/userspace/owl-mdns-respond.py" "${lib}/owl-mdns-respond.py"
   install -Dm755 build/daemon/owl "${lib}/owl"
+  install -Dm755 hostapd-2.11/hostapd/hostapd "${lib}/hostapd-go"
+  install -Dm644 hostapd-2.11/COPYING "${pkgdir}/usr/share/licenses/${pkgname}/hostapd-BSD"
   for f in "${_from_omdrop_awdl[@]}"; do
     install -Dm755 "omdrop-awdl/userspace/${f}" "${lib}/${f}"
   done

@@ -1,0 +1,272 @@
+{
+ "running": true,
+ "mode": "menu",
+ "remainingSeconds": null,
+ "name": "omarchy-desktop",
+ "directory": "/home/monke/Downloads",
+ "error": "",
+ "protocols": [
+  {
+   "id": "airdrop",
+   "name": "AirDrop",
+   "state": "unavailable",
+   "reason": "The AWDL interface is missing. The Wi-Fi driver needs loading before AirDrop can start; see the docs."
+  },
+  {
+   "id": "quickshare",
+   "name": "Quick Share",
+   "state": "advertising",
+   "reason": ""
+  },
+  {
+   "id": "localsend",
+   "name": "LocalSend",
+   "state": "advertising",
+   "reason": ""
+  }
+ ],
+ "peers": [
+  {
+   "id": "localsend:0",
+   "name": "Device number 00 with a fairly long name",
+   "protocol": "localsend",
+   "deviceType": "desktop"
+  },
+  {
+   "id": "localsend:1",
+   "name": "Device number 01 with a fairly long name",
+   "protocol": "localsend",
+   "deviceType": "desktop"
+  },
+  {
+   "id": "localsend:2",
+   "name": "Device number 02 with a fairly long name",
+   "protocol": "localsend",
+   "deviceType": "desktop"
+  },
+  {
+   "id": "localsend:3",
+   "name": "Device number 03 with a fairly long name",
+   "protocol": "localsend",
+   "deviceType": "desktop"
+  },
+  {
+   "id": "localsend:4",
+   "name": "Device number 04 with a fairly long name",
+   "protocol": "localsend",
+   "deviceType": "desktop"
+  },
+  {
+   "id": "localsend:5",
+   "name": "Device number 05 with a fairly long name",
+   "protocol": "localsend",
+   "deviceType": "desktop"
+  },
+  {
+   "id": "localsend:6",
+   "name": "Device number 06 with a fairly long name",
+   "protocol": "localsend",
+   "deviceType": "desktop"
+  },
+  {
+   "id": "localsend:7",
+   "name": "Device number 07 with a fairly long name",
+   "protocol": "localsend",
+   "deviceType": "desktop"
+  },
+  {
+   "id": "localsend:8",
+   "name": "Device number 08 with a fairly long name",
+   "protocol": "localsend",
+   "deviceType": "desktop"
+  },
+  {
+   "id": "localsend:9",
+   "name": "Device number 09 with a fairly long name",
+   "protocol": "localsend",
+   "deviceType": "desktop"
+  },
+  {
+   "id": "localsend:10",
+   "name": "Device number 10 with a fairly long name",
+   "protocol": "localsend",
+   "deviceType": "desktop"
+  },
+  {
+   "id": "localsend:11",
+   "name": "Device number 11 with a fairly long name",
+   "protocol": "localsend",
+   "deviceType": "desktop"
+  },
+  {
+   "id": "localsend:12",
+   "name": "Device number 12 with a fairly long name",
+   "protocol": "localsend",
+   "deviceType": "desktop"
+  },
+  {
+   "id": "localsend:13",
+   "name": "Device number 13 with a fairly long name",
+   "protocol": "localsend",
+   "deviceType": "desktop"
+  },
+  {
+   "id": "localsend:14",
+   "name": "Device number 14 with a fairly long name",
+   "protocol": "localsend",
+   "deviceType": "desktop"
+  },
+  {
+   "id": "localsend:15",
+   "name": "Device number 15 with a fairly long name",
+   "protocol": "localsend",
+   "deviceType": "desktop"
+  },
+  {
+   "id": "localsend:16",
+   "name": "Device number 16 with a fairly long name",
+   "protocol": "localsend",
+   "deviceType": "desktop"
+  },
+  {
+   "id": "localsend:17",
+   "name": "Device number 17 with a fairly long name",
+   "protocol": "localsend",
+   "deviceType": "desktop"
+  },
+  {
+   "id": "localsend:18",
+   "name": "Device number 18 with a fairly long name",
+   "protocol": "localsend",
+   "deviceType": "desktop"
+  },
+  {
+   "id": "localsend:19",
+   "name": "Device number 19 with a fairly long name",
+   "protocol": "localsend",
+   "deviceType": "desktop"
+  },
+  {
+   "id": "localsend:20",
+   "name": "Device number 20 with a fairly long name",
+   "protocol": "localsend",
+   "deviceType": "desktop"
+  },
+  {
+   "id": "localsend:21",
+   "name": "Device number 21 with a fairly long name",
+   "protocol": "localsend",
+   "deviceType": "desktop"
+  },
+  {
+   "id": "localsend:22",
+   "name": "Device number 22 with a fairly long name",
+   "protocol": "localsend",
+   "deviceType": "desktop"
+  },
+  {
+   "id": "localsend:23",
+   "name": "Device number 23 with a fairly long name",
+   "protocol": "localsend",
+   "deviceType": "desktop"
+  },
+  {
+   "id": "localsend:24",
+   "name": "Device number 24 with a fairly long name",
+   "protocol": "localsend",
+   "deviceType": "desktop"
+  },
+  {
+   "id": "localsend:25",
+   "name": "Device number 25 with a fairly long name",
+   "protocol": "localsend",
+   "deviceType": "desktop"
+  },
+  {
+   "id": "localsend:26",
+   "name": "Device number 26 with a fairly long name",
+   "protocol": "localsend",
+   "deviceType": "desktop"
+  },
+  {
+   "id": "localsend:27",
+   "name": "Device number 27 with a fairly long name",
+   "protocol": "localsend",
+   "deviceType": "desktop"
+  },
+  {
+   "id": "localsend:28",
+   "name": "Device number 28 with a fairly long name",
+   "protocol": "localsend",
+   "deviceType": "desktop"
+  },
+  {
+   "id": "localsend:29",
+   "name": "Device number 29 with a fairly long name",
+   "protocol": "localsend",
+   "deviceType": "desktop"
+  },
+  {
+   "id": "localsend:30",
+   "name": "Device number 30 with a fairly long name",
+   "protocol": "localsend",
+   "deviceType": "desktop"
+  },
+  {
+   "id": "localsend:31",
+   "name": "Device number 31 with a fairly long name",
+   "protocol": "localsend",
+   "deviceType": "desktop"
+  },
+  {
+   "id": "localsend:32",
+   "name": "Device number 32 with a fairly long name",
+   "protocol": "localsend",
+   "deviceType": "desktop"
+  },
+  {
+   "id": "localsend:33",
+   "name": "Device number 33 with a fairly long name",
+   "protocol": "localsend",
+   "deviceType": "desktop"
+  },
+  {
+   "id": "localsend:34",
+   "name": "Device number 34 with a fairly long name",
+   "protocol": "localsend",
+   "deviceType": "desktop"
+  },
+  {
+   "id": "localsend:35",
+   "name": "Device number 35 with a fairly long name",
+   "protocol": "localsend",
+   "deviceType": "desktop"
+  },
+  {
+   "id": "localsend:36",
+   "name": "Device number 36 with a fairly long name",
+   "protocol": "localsend",
+   "deviceType": "desktop"
+  },
+  {
+   "id": "localsend:37",
+   "name": "Device number 37 with a fairly long name",
+   "protocol": "localsend",
+   "deviceType": "desktop"
+  },
+  {
+   "id": "localsend:38",
+   "name": "Device number 38 with a fairly long name",
+   "protocol": "localsend",
+   "deviceType": "desktop"
+  },
+  {
+   "id": "localsend:39",
+   "name": "Device number 39 with a fairly long name",
+   "protocol": "localsend",
+   "deviceType": "desktop"
+  }
+ ],
+ "incoming": [],
+ "transfers": []
+}

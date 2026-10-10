@@ -1,0 +1,31 @@
+{
+ "running": true,
+ "mode": "menu",
+ "remainingSeconds": null,
+ "name": "omarchy-desktop",
+ "directory": "/home/monke/Downloads",
+ "error": "No sharing protocol could start.",
+ "protocols": [
+  {
+   "id": "airdrop",
+   "name": "AirDrop",
+   "state": "unavailable",
+   "reason": "The AWDL interface is missing. The Wi-Fi driver needs loading."
+  },
+  {
+   "id": "quickshare",
+   "name": "Quick Share",
+   "state": "unavailable",
+   "reason": "The Quick Share helper is not running."
+  },
+  {
+   "id": "localsend",
+   "name": "LocalSend",
+   "state": "unavailable",
+   "reason": "Port 53317 is already in use by another program."
+  }
+ ],
+ "peers": [],
+ "incoming": [],
+ "transfers": []
+}

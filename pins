@@ -8,3 +8,6 @@ OWL_COMMIT=832d70f815c3d4a06a02117bf0fc5e868daa1ff0
 # omdrop-awdl, the Broadcom radio package (0.8.1): only its radio-independent
 # tools are used, unmodified.
 OMDROP_AWDL_COMMIT=534f91a525337951ca19c311e53d333bd6d55100
+# Receiver branch with the radio-backend probe contract (no Broadcom gate).
+OMDROP_RECEIVER_REPO=https://github.com/t4t5/omdrop-plugin.git
+OMDROP_RECEIVER_COMMIT=963d98e022bb74e1da5fae8a766f522d4d518fa8

@@ -30,6 +30,9 @@
 # everything lives at fixed paths: helpers beside this script (/usr/lib/omdrop
 # when packaged), state in $RUN, tunables in $CONF.
 set -uo pipefail
+# status and peers are public read-only commands even when the caller that
+# starts a window uses a private umask (the OmaDrop coordinator uses 077).
+umask 022
 
 SELF=$(readlink -f "$0")
 LIB=$(dirname "$SELF")
@@ -38,6 +41,8 @@ CONF=${OMDROP_CONF:-/etc/omdrop}
 OWL_LOG=$RUN/owl.log
 IF=awdl0
 MON=mon0
+GO=omgo0
+GO_BIN=$LIB/hostapd-go
 OWL_BIN=$LIB/owl
 PROFILES=$LIB/owl-profiles
 # Receiver capability flags in the announcement, as omdrop-awdl sends them:
@@ -139,7 +144,7 @@ cmd_status() {
 # randomise their AWDL address, so nothing here remembers one.
 cmd_peers() {
   [ -r "$OWL_LOG" ] || die "no OWL log at $OWL_LOG; is the radio up?" 4
-  grep -oE '(add|remove) peer [0-9a-f:]+' "$OWL_LOG" | awk '
+  { grep -oE '(add|remove) peer [0-9a-f:]+' "$OWL_LOG" || [ "$?" = 1 ]; } | awk '
     { n = split($3, o, ":"); mac = ""
       for (i = 1; i <= n; i++) mac = mac (i > 1 ? ":" : "") sprintf("%02s", o[i])
       gsub(/ /, "0", mac)
@@ -166,13 +171,19 @@ cmd_probe() {
     missing+=("hardware|$(untested_hint "$drv")")
   else
     [ -x "$OWL_BIN" ] || missing+=("backend|omdrop-owl is installed without OWL ($OWL_BIN). Reinstall omdrop-owl.")
-    [ "$PROF_MODE" = shared ] || missing+=("backend|This Wi-Fi card's profile asks for \"$PROF_MODE\" mode, which omdrop-owl doesn't implement yet.")
+    case "$PROF_MODE" in shared|standalone|dualchan) ;; *) missing+=("backend|Unknown radio mode: $PROF_MODE.") ;; esac
     ap=$(iw dev "$sta" link 2>/dev/null | awk '/freq:/ {print int($2)}')
+    if [ "$PROF_MODE" = dualchan ]; then
+      [ -x "$GO_BIN" ] || missing+=("backend|Wi-Fi Direct radio helper is missing; reinstall omdrop-owl.")
+    elif [ "$PROF_MODE" = standalone ]; then
+      [ -z "$ap" ] || missing+=("radio|Standalone AirDrop needs an idle Wi-Fi card; disconnect Wi-Fi first.")
+    else
     case "$ap" in
       2437|5220|5745) ;;
       "") missing+=("radio|Wi-Fi isn't connected, and AirDrop shares its channel. Connect to Wi-Fi first.") ;;
       *) missing+=("radio|Your Wi-Fi network is on $ap MHz, but AirDrop can only share channel 6, 44 or 149 with it. Moving the router to one of those makes this work.") ;;
     esac
+    fi
   fi
   [ "${1:-}" = --json ] || { printf '%s\n' "${missing[@]:-ready}"; return 0; }
   MISSING=$(printf '%s\n' "${missing[@]}") HW=$hw V=$VERSION C=$CONTRACT python3 -c '
@@ -194,10 +205,26 @@ cmd_stop() {
   # The supervisor calls `stop expired` itself; don't kill the caller.
   [ -n "$sup" ] && [ "$sup" != "$$" ] && [ "$sup" != "${PPID:-}" ] && kill "$sup" 2>/dev/null
   pkill -f -- "$LIB/awdl-airdrop-adv.py" 2>/dev/null
+  for service in mdns ble; do
+    alive "$(pid_of "$service")" "$LIB/" && kill "$(pid_of "$service")" 2>/dev/null
+    rm -f "$RUN/$service.pid"
+  done
   alive "$(pid_of owl)" "$OWL_BIN" && kill "$(pid_of owl)" 2>/dev/null
   pkill -f "^$OWL_BIN " 2>/dev/null
   ip link set "$MON" down 2>/dev/null
   iw dev "$MON" del 2>/dev/null
+  if [ -f "$RUN/go-owned" ]; then
+    alive "$(pid_of go)" "$GO_BIN" && kill "$(pid_of go)" 2>/dev/null
+    iw dev "$GO" del 2>/dev/null
+    rm -f "$RUN/go-owned" "$RUN/go.pid" "$RUN/hostapd.conf"
+  fi
+  if [ -r "$RUN/idle-station" ]; then
+    local idle was_managed was_up
+    read -r idle was_managed was_up < "$RUN/idle-station"
+    [ "$was_up" = yes ] && ip link set "$idle" up
+    [ "$was_managed" = yes ] && nmcli device set "$idle" managed yes >/dev/null 2>&1
+    rm -f "$RUN/idle-station"
+  fi
   sta=$(cat "$RUN/station" 2>/dev/null)
   pm=$(cat "$RUN/pm" 2>/dev/null)
   if [ -n "$sta" ] && [ -n "$pm" ]; then
@@ -215,7 +242,7 @@ cmd_stop() {
     1) reconnect=yes ;;
     *) reconnect=$(awk '{print $4}' "$RUN/profile" 2>/dev/null) ;;
   esac
-  if [ -n "$sta" ] && [ "$reconnect" = yes ]; then
+  if [ -n "$sta" ] && [ "$reconnect" = yes ] && [ "$(awk '{print $2}' "$RUN/profile" 2>/dev/null)" = shared ]; then
     sleep 1
     nmcli -w 20 device connect "$sta" >/dev/null 2>&1 || iw dev "$sta" disconnect 2>/dev/null
   fi
@@ -240,6 +267,17 @@ supervise() {
       log "OWL exited: $(tail -1 "$OWL_LOG" 2>/dev/null)"
       exec "$SELF" stop owl-exited
     fi
+    if [ -f "$RUN/go-owned" ] && ! alive "$(pid_of go)" "$GO_BIN"; then
+      exec "$SELF" stop wifi-direct-exited
+    fi
+    if ! alive "$(pid_of mdns)" "$LIB/owl-mdns-respond.py"; then
+      python3 "$LIB/owl-mdns-respond.py" --iface "$IF" --flags "$ADV_FLAGS" --port 8771 >> "$RUN/mdns.log" 2>&1 &
+      echo $! > "$RUN/mdns.pid"
+    fi
+    if ! alive "$(pid_of ble)" "$LIB/ble-airdrop-adv.py"; then
+      python3 "$LIB/ble-airdrop-adv.py" --seconds 86400 --hashes 0000000000000000 >> "$RUN/ble.log" 2>&1 &
+      echo $! > "$RUN/ble.pid"
+    fi
     python3 "$LIB/awdl-airdrop-adv.py" --iface "$IF" --plain --flags "$ADV_FLAGS" --port 8771 \
       --count 3 --interval 0.05 >> "$RUN/announce.log" 2>&1
     sleep "$ADV_INTERVAL"
@@ -247,7 +285,7 @@ supervise() {
 }
 
 cmd_start() {
-  local secs=${1:-} sta drv gw ap chan stamac monmac mt76 _
+  local secs=${1:-} sta drv gw ap chan stamac monmac mt76 _ was_managed was_up
   local owl_extra=()
   [[ "$secs" =~ ^[0-9]+$ ]] || die "usage: omdrop-discoverable start <seconds>" 2
   need_root
@@ -272,7 +310,21 @@ cmd_start() {
   if [ "$PROF_STATUS" != tested ] && [ "$(knob allow-untested)" != 1 ]; then
     die "$(untested_hint "$drv")" 4
   fi
-  [ "$PROF_MODE" = shared ] || die "this Wi-Fi card's profile asks for \"$PROF_MODE\" mode, which omdrop-owl doesn't implement yet" 4
+  case "$PROF_MODE" in shared|standalone|dualchan) ;; *) die "unknown radio mode: $PROF_MODE" 4 ;; esac
+  if [ "$PROF_MODE" = dualchan ]; then
+    [ -x "$GO_BIN" ] || die "Wi-Fi Direct radio helper is missing" 4
+    chan=$(knob airdrop-channel)
+    chan=${chan:-149}
+    case "$chan" in 6|44|149) ;; *) die "airdrop-channel must be 6, 44 or 149" 2 ;; esac
+    gw=""
+  elif [ "$PROF_MODE" = standalone ]; then
+    ap=$(iw dev "$sta" link | awk '/freq:/ {print int($2)}')
+    [ -z "$ap" ] || die "standalone AirDrop needs an idle Wi-Fi card; disconnect Wi-Fi first" 3
+    chan=$(knob standalone-channel)
+    chan=${chan:-6}
+    case "$chan" in 6|44|149) ;; *) die "standalone-channel must be 6, 44 or 149" 2 ;; esac
+    gw=""
+  else
   # Wi-Fi takes a few seconds after a driver reload to associate and get an
   # address; don't judge a link that's still coming up.
   for _ in $(seq 15); do
@@ -287,14 +339,59 @@ cmd_start() {
     2437) chan=6 ;; 5220) chan=44 ;; 5745) chan=149 ;;
     *) die "your Wi-Fi network is on ${ap:-an unknown} MHz, but AirDrop can only share channel 6, 44 or 149 with it. Moving the router to one of those makes this work." 3 ;;
   esac
+  fi
   stamac=$(cat "/sys/class/net/$sta/address")
   echo "$sta" > "$RUN/station"
   echo "$drv $PROF_MODE $PROF_MONMAC $PROF_RECONNECT $PROF_PM" > "$RUN/profile"
   log "station $sta ($stamac, $drv) on ch$chan, gateway $gw; profile: mode=$PROF_MODE mon_mac=$PROF_MONMAC reconnect=$PROF_RECONNECT mt76_pm=$PROF_PM"
 
-  iw dev "$MON" del 2>/dev/null
+  if iw dev "$MON" info >/dev/null 2>&1; then
+    die "$MON already exists; refusing to replace an interface not owned by this window" 4
+  fi
+  if [ "$PROF_MODE" = dualchan ]; then
+    iw dev "$GO" info >/dev/null 2>&1 && die "$GO already exists; refusing to replace it" 4
+    iw phy "$(basename "$(readlink -f "/sys/class/net/$sta/phy80211")")" interface add "$GO" type __p2pgo \
+      || die "could not create the Wi-Fi Direct interface" 4
+    touch "$RUN/go-owned"
+    local gomac pass hw
+    gomac="02:$(head -c5 /dev/urandom | od -An -tx1 | xargs | tr ' ' ':')"
+    ip link set "$GO" address "$gomac"
+    nmcli device set "$GO" managed no >/dev/null 2>&1 || true
+    sysctl -w "net.ipv6.conf.$GO.disable_ipv6=1" >/dev/null
+    ip link set "$GO" up || { cmd_stop go-failed >/dev/null; die "could not bring Wi-Fi Direct up" 4; }
+    pass=$(head -c16 /dev/urandom | od -An -tx1 | tr -d ' \n')
+    hw=a; [ "$chan" = 6 ] && hw=g
+    (umask 077; cat > "$RUN/hostapd.conf" <<EOF
+interface=$GO
+driver=nl80211
+ssid=OmaDrop-radio
+ignore_broadcast_ssid=1
+hw_mode=$hw
+channel=$chan
+ieee80211n=1
+wmm_enabled=1
+wpa=2
+wpa_passphrase=$pass
+wpa_key_mgmt=WPA-PSK
+rsn_pairwise=CCMP
+EOF
+    )
+    setsid env HOSTAPD_P2P_GO=1 "$GO_BIN" "$RUN/hostapd.conf" > "$RUN/go.log" 2>&1 < /dev/null 9>&- &
+    echo $! > "$RUN/go.pid"
+    for _ in $(seq 30); do grep -q AP-ENABLED "$RUN/go.log" && break; sleep 0.2; done
+    grep -q AP-ENABLED "$RUN/go.log" || { cmd_stop go-failed >/dev/null; die "Wi-Fi Direct radio did not start; see /run/omdrop-owl/go.log" 4; }
+    stamac=$gomac
+  fi
+  if [ "$PROF_MODE" = standalone ]; then
+    was_managed=$(nmcli -g GENERAL.NM-MANAGED device show "$sta")
+    was_up=no
+    ip -o link show "$sta" | grep -q '<[^>]*\bUP\b' && was_up=yes
+    printf '%s %s %s\n' "$sta" "$was_managed" "$was_up" > "$RUN/idle-station"
+    nmcli device set "$sta" managed no >/dev/null 2>&1
+    ip link set "$sta" down
+  fi
   iw phy "$(basename "$(readlink -f "/sys/class/net/$sta/phy80211")")" interface add "$MON" type monitor \
-    || die "could not create the monitor interface $MON" 4
+    || { cmd_stop monitor-failed >/dev/null; die "could not create the monitor interface $MON" 4; }
   # mon_mac: the station's MAC on the monitor interface, or one of its own
   # (locally administered, derived from the station's) with OWL told the
   # station's through -m.
@@ -305,7 +402,10 @@ cmd_start() {
     monmac=$stamac
   fi
   ip link set "$MON" address "$monmac"
-  ip link set "$MON" up || die "could not bring $MON up" 4
+  ip link set "$MON" up || { cmd_stop monitor-failed >/dev/null; die "could not bring $MON up" 4; }
+  if [ "$PROF_MODE" = standalone ]; then
+    iw dev "$MON" set channel "$chan" || { cmd_stop channel-failed >/dev/null; die "could not tune $MON to channel $chan" 4; }
+  fi
 
   # mt76_pm: runtime PM off for the window, restored by stop.
   mountpoint -q /sys/kernel/debug || mount -t debugfs none /sys/kernel/debug 2>/dev/null

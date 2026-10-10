@@ -1,5 +1,10 @@
 # omdrop-owl
 
+This fork also includes a native Omarchy **OmaDrop** panel for AirDrop, Quick
+Share and LocalSend. See [universal sharing](docs/universal-sharing.md) for
+installation and backend requirements. The original radio backend below
+continues to work independently.
+
 https://github.com/user-attachments/assets/b195ce4c-e078-49be-bc13-44a72b6dc189
 
 The radio half of [omdrop](https://github.com/brentkearney/omdrop-plugin) for

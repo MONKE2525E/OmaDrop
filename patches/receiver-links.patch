@@ -1,0 +1,27 @@
+--- a/bin/airdrop-serve.py
++++ b/bin/airdrop-serve.py
+@@ -835,17 +835,14 @@
+ 
+         # A `links` transfer is Ask-only: with SUPPORTS_URL (0x01) advertised,
+         # iOS puts the URL straight into Items and sends no /Upload at all, so
+-        # accepting the Ask IS the transfer. Store it, or the link is lost.
+-        # NEVER open it: in Everyone mode any device in range could otherwise
+-        # make this machine visit an arbitrary URL. A file the user clicks is
+-        # the whole interaction we are willing to offer.
++        # accepting the Ask IS the transfer. Open only after explicit approval.
+         if 'links' in (ask.get('TransferType') or {}):
+-            for item in items:
+-                if not isinstance(item, str) or not item.startswith(('http://', 'https://')):
+-                    logging.warning('ask: ignoring non-http item %.80r', item)
+-                    continue
+-                stored = store_link(item, DEST)
+-                logging.info('link stored as %s -> %s', stored, item)
++            try:
++                opened = airdrop_consent.store_links(self, DEST)
++                logging.info('approved links opened: %d', len(opened))
++            except (OSError, ValueError):
++                self.reject(500, 'Approved links could not be opened')
++                return
+         resp = plistlib.dumps({
+             'ReceiverMediaCapabilities': MEDIA_CAPABILITIES,
+             'ReceiverComputerName': NAME,

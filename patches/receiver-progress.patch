@@ -1,0 +1,50 @@
+--- a/bin/airdrop-serve.py
++++ b/bin/airdrop-serve.py
+@@ -596,6 +596,7 @@
+                         sink = ExtractedFileWriter(output, budget, name)
+                         for block in entry.get_blocks():
+                             sink.write(block)
++                            airdrop_consent.report(consent, count=len(block))
+                     written.append(name)
+             if consent['expected']:
+                 raise ValueError('Archive omitted approved files')
+@@ -861,18 +862,23 @@
+         # An Upload that never passed an Ask has nothing vouching for it, and
+         # the Upload itself carries no validation record to judge.
+         if contacts.visibility() == 'contacts' and not getattr(self, '_contacts_ok', False):
++            airdrop_consent.report(consent, 'failed')
+             self.reject(403, 'contacts-only upload has no accepted Ask')
+             return
+         ctype = self.headers.get('Content-Type', '').split(';')[0].strip().lower()
+         if ctype != 'application/x-dvzip':
++            airdrop_consent.report(consent, 'failed')
+             self.reject(415, f'unsupported Content-Type {ctype!r}')
+             return
+         if not UPLOAD_SLOTS.acquire(blocking=False):
++            airdrop_consent.report(consent, 'failed')
+             self.reject(503, 'too many uploads in progress')
+             return
+         tid = safe_name(self.headers.get('TransferID', ''), 'upload')
+         deadline = ReadDeadline()
+         plan = None
++        completed = False
++        airdrop_consent.report(consent)
+         try:
+             receive_budget = ReceiveBudget(DEST, MAX_RECEIVE_PERCENT)
+             plan = body_plan(self.headers, receive_budget.byte_limit)
+@@ -892,6 +898,7 @@
+                              tid, wire_bytes, self.headers.get('TotalBytes'))
+                 written = store_upload(raw, DEST, tid, receive_budget, consent)
+             logging.info('upload %s: stored %s', tid, ', '.join(written))
++            completed = True
+         except socket.timeout as e:
+             # Chunked framing announces no length, so there is none to name.
+             expected = plan[1] if plan else None
+@@ -910,6 +917,7 @@
+             self.reject(422, f'upload is not a valid bounded DVZip archive: {e}')
+             return
+         finally:
++            airdrop_consent.report(consent, 'complete' if completed else 'failed')
+             UPLOAD_SLOTS.release()
+         self.send_response(200)
+         self.send_header('Content-Length', '0')

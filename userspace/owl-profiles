@@ -7,8 +7,9 @@
 #
 #   status     tested: works out of the box; untested: needs allow-untested
 #   mode       shared: AWDL shares the AP's channel and Wi-Fi stays connected
-#              (the only mode so far; cards that can't inject while associated
-#              will need an "exclusive" mode that takes Wi-Fi for the window)
+#              dualchan: Wi-Fi Direct holds an independent AirDrop channel
+#              standalone: reserve an idle card on standalone-channel (6 by
+#              default); refuses an associated station and restores its state
 #   mon_mac    station: the monitor interface carries the station's MAC, and OWL
 #              reads it from there; own: it keeps a MAC of its own and OWL is
 #              given the station's (owl -m)
@@ -19,4 +20,5 @@
 #
 # driver   status    mode    mon_mac  reconnect  mt76_pm  notes
 mt7925e    tested    shared  station  yes        yes      MediaTek MT7925 (Framework 13). Injects while associated, sending from the station's MAC; the station ACKs the phone's unicast. Without a reconnect, the station stops receiving 3-165 s after a monitor interface is deleted.
+rtw89_8852be untested dualchan station no        no       RTL8852BE: Mac AWDL discovery and a protocol-client upload verified; native Finder sending remains unverified.
 *          untested  shared  station  yes        no       Any other card. Needs monitor-mode injection while associated, and an AP on channel 6, 44 or 149.

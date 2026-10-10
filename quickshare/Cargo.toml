@@ -1,0 +1,14 @@
+[package]
+name = "omadrop-quickshare"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+
+[dependencies]
+rqs_lib = { git = "https://github.com/Martichou/rquickshare", rev = "378d8ae969941bee4bf60ad34ac9cf8bb7005eb7" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "io-util", "sync", "signal"] }
+serde_json = "1"
+log = "0.4"
+base64 = "0.22"
+get_if_addrs = "0.5"
+mdns-sd = { git = "https://github.com/Martichou/mdns-sd", branch = "unsolicited" }
