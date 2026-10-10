@@ -556,10 +556,70 @@ class LocalSendTests(unittest.IsolatedAsyncioTestCase):
         await self.control.post("/", json={"command": "lease", "durationSeconds": 5})
         self.service.window_timer.cancel()
         await asyncio.gather(self.service.window_timer, return_exceptions=True)
-        self.service.menu_until = time.time() - 1
+        self.service.menu_leases[omadrop.LEGACY_MENU_LEASE_ID] = time.time() - 1
         await self.service.expire_window()
         self.assertFalse(self.service.running)
         self.assertEqual(self.service.snapshot()["mode"], "off")
+
+    async def test_menu_leases_release_only_the_calling_panel(self):
+        for lease_id in ("panel-one", "panel-two"):
+            response = await self.control.post("/", json={
+                "command": "lease", "durationSeconds": 30, "leaseId": lease_id,
+            })
+            self.assertEqual(response.status, 200)
+        response = await self.control.post("/", json={
+            "command": "release", "leaseId": "panel-one",
+        })
+        self.assertEqual(response.status, 200)
+        self.assertTrue(self.service.running)
+        self.assertEqual(set(self.service.menu_leases), {"panel-two"})
+        self.assertEqual(self.service.snapshot()["mode"], "menu")
+
+        response = await self.control.post("/", json={"command": "release"})
+        self.assertEqual(response.status, 200)
+        self.assertTrue(self.service.running)
+        self.assertEqual(set(self.service.menu_leases), {"panel-two"})
+        response = await self.control.post("/", json={
+            "command": "release", "leaseId": "panel-two",
+        })
+        self.assertEqual(response.status, 200)
+        self.assertFalse(self.service.running)
+        self.assertEqual(self.service.menu_leases, {})
+
+    async def test_menu_lease_ids_are_validated_and_the_lease_map_is_bounded(self):
+        for lease_id in ("legacy", "../bad", "x" * 65, None):
+            response = await self.control.post("/", json={
+                "command": "lease", "durationSeconds": 30, "leaseId": lease_id,
+            })
+            self.assertEqual(response.status, 400)
+        with patch.object(omadrop, "MAX_MENU_LEASES", 2):
+            for lease_id in ("first", "second"):
+                response = await self.control.post("/", json={
+                    "command": "lease", "durationSeconds": 30,
+                    "leaseId": lease_id,
+                })
+                self.assertEqual(response.status, 200)
+            response = await self.control.post("/", json={
+                "command": "lease", "durationSeconds": 30,
+                "leaseId": "third",
+            })
+        self.assertEqual(response.status, 400)
+        self.assertEqual(set(self.service.menu_leases), {"first", "second"})
+
+    async def test_expired_last_menu_lease_stops_and_does_not_survive_daemon_restart(self):
+        response = await self.control.post("/", json={
+            "command": "lease", "durationSeconds": 30, "leaseId": "panel-one",
+        })
+        self.assertEqual(response.status, 200)
+        timer = self.service.window_timer
+        timer.cancel()
+        await asyncio.gather(timer, return_exceptions=True)
+        self.service.menu_leases["panel-one"] = time.time() - 1
+        await self.service.expire_window()
+        self.assertFalse(self.service.running)
+        self.assertEqual(self.service.snapshot()["mode"], "off")
+        restarted = omadrop.Coordinator()
+        self.assertEqual(restarted.menu_leases, {})
 
     async def test_dismiss_does_not_remove_active_transfers(self):
         self.service.transfers.update({
@@ -747,6 +807,77 @@ class LocalSendTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.service.transfers[request_id]["state"], "complete")
         self.assertFalse(list(self.directory.glob("*.part")))
 
+    async def test_progress_refreshes_upload_and_session_idle_timeouts(self):
+        content = b"0123456789"
+        task, request_id = await self.prepare(content=content)
+        session = await self.approve(task, request_id)
+        first_chunk = asyncio.Event()
+
+        async def slow_chunks():
+            for index, byte in enumerate(content):
+                await asyncio.sleep(0.02)
+                if index == 0:
+                    first_chunk.set()
+                yield bytes((byte,))
+
+        async def expire_sessions_while_uploading():
+            while not upload.done():
+                await asyncio.sleep(0.02)
+                self.service.expire_localsend_sessions()
+
+        started = time.monotonic()
+        with patch.object(omadrop, "LOCALSEND_UPLOAD_IDLE_TIMEOUT", 0.06), patch.object(
+            omadrop, "LOCALSEND_SESSION_IDLE_TIMEOUT", 0.07
+        ):
+            upload = asyncio.create_task(self.upload(session, slow_chunks()))
+            expirer = asyncio.create_task(expire_sessions_while_uploading())
+            try:
+                await asyncio.wait_for(first_chunk.wait(), 1)
+                response = await asyncio.wait_for(upload, 2)
+            finally:
+                expirer.cancel()
+                await asyncio.gather(expirer, return_exceptions=True)
+
+        self.assertGreater(time.monotonic() - started, 0.07)
+        self.assertEqual(response.status, 200)
+        self.assertEqual((self.directory / "test.txt").read_bytes(), content)
+        self.assertEqual(self.service.transfers[request_id]["state"], "complete")
+        self.assertNotIn(request_id, self.service.sessions)
+        self.assertFalse(list(self.directory.glob(".omadrop-*.part")))
+
+    async def test_stalled_upload_hits_idle_timeout_and_removes_partial_file(self):
+        task, request_id = await self.prepare(content=b"hello")
+        session = await self.approve(task, request_id)
+        first_chunk = asyncio.Event()
+        continue_upload = asyncio.Event()
+
+        async def stalled_chunks():
+            yield b"he"
+            first_chunk.set()
+            await continue_upload.wait()
+            yield b"llo"
+
+        with patch.object(omadrop, "LOCALSEND_UPLOAD_IDLE_TIMEOUT", 0.04):
+            upload = asyncio.create_task(self.upload(session, stalled_chunks()))
+            try:
+                await asyncio.wait_for(first_chunk.wait(), 1)
+                for _ in range(100):
+                    if list(self.directory.glob(".omadrop-*.part")):
+                        break
+                    await asyncio.sleep(0.01)
+                self.assertTrue(list(self.directory.glob(".omadrop-*.part")))
+                await asyncio.sleep(0.06)
+                continue_upload.set()
+                response = await asyncio.wait_for(upload, 2)
+            finally:
+                continue_upload.set()
+
+        self.assertEqual(response.status, 408)
+        self.assertEqual(self.service.transfers[request_id]["state"], "failed")
+        self.assertTrue(self.service.transfers[request_id]["error"])
+        self.assertFalse(list(self.directory.glob(".omadrop-*.part")))
+        self.assertFalse((self.directory / "test.txt").exists())
+
     async def test_decline(self):
         task, request_id = await self.prepare()
         await self.control.post("/", json={"command": "reject", "id": request_id})
@@ -876,6 +1007,150 @@ class LocalSendTests(unittest.IsolatedAsyncioTestCase):
             )
         finally:
             await receiver.stop()
+
+    async def test_slow_healthy_outbound_localsend_body_exceeds_idle_deadlines_over_https(self):
+        receiver = LocalOnly()
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            receiver.port = sock.getsockname()[1]
+        receiver.settings["directory"] = str(Path(self.temp.name) / "slow-receiver")
+        await receiver.start()
+        source = Path(self.temp.name) / "slow-outbound.bin"
+        content = b"x" * (16 * 1024)
+        source.write_bytes(content)
+        peer = {
+            "id": "localsend:slow-receiver", "name": "Slow receiver",
+            "protocol": "localsend", "host": "127.0.0.1",
+            "port": receiver.port, "scheme": "https",
+            "fingerprint": receiver.fingerprint,
+        }
+        self.service.peers[peer["id"]] = dict(peer, seen=0, deviceType="desktop")
+        first_chunk = asyncio.Event()
+
+        async def paced_chunks(path, transfer):
+            with path.open("rb") as source_file:
+                while data := source_file.read(1024):
+                    yield data
+                    transfer["bytes"] += len(data)
+                    first_chunk.set()
+                    await asyncio.sleep(0.02)
+
+        async def monitor_progress():
+            while not sending.done():
+                await asyncio.sleep(0.01)
+                await self.service.expire_stalled_transfers()
+
+        self.assertIsNone(self.service.local_send_timeout().total)
+        with patch.object(omadrop, "TRANSFER_IDLE_TIMEOUT", 0.05), patch.object(
+            omadrop, "LOCALSEND_RESPONSE_IDLE_TIMEOUT", 0.08
+        ), patch.object(self.service, "local_send_chunks", paced_chunks):
+            started = time.monotonic()
+            sending = self.service.spawn(
+                self.service.send_files(peer, [str(source)], "slow-outbound")
+            )
+            sending.set_name("slow-outbound")
+            monitor = None
+            try:
+                for _ in range(100):
+                    if receiver.incoming:
+                        break
+                    await asyncio.sleep(0.01)
+                self.assertTrue(receiver.incoming)
+                next(iter(receiver.incoming.values()))["decision"].set_result(True)
+                await asyncio.wait_for(first_chunk.wait(), 2)
+                monitor = asyncio.create_task(monitor_progress())
+                await asyncio.wait_for(sending, 5)
+            finally:
+                if monitor is not None:
+                    monitor.cancel()
+                    await asyncio.gather(monitor, return_exceptions=True)
+                await receiver.stop()
+
+        self.assertGreater(time.monotonic() - started, 0.08)
+        self.assertEqual(self.service.transfers["slow-outbound"]["state"], "complete")
+        self.assertEqual(self.service.transfers["slow-outbound"]["bytes"], len(content))
+        self.assertEqual(
+            (Path(receiver.settings["directory"]) / source.name).read_bytes(), content
+        )
+
+    async def test_outbound_localsend_stall_is_cancelled_by_progress_watchdog(self):
+        receiver = LocalOnly()
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            receiver.port = sock.getsockname()[1]
+        receiver.settings["directory"] = str(Path(self.temp.name) / "stalled-receiver")
+        await receiver.start()
+        source = Path(self.temp.name) / "stalled-outbound.bin"
+        source.write_bytes(b"x" * (16 * 1024))
+        peer = {
+            "id": "localsend:stalled-receiver", "name": "Stalled receiver",
+            "protocol": "localsend", "host": "127.0.0.1",
+            "port": receiver.port, "scheme": "https",
+            "fingerprint": receiver.fingerprint,
+        }
+        self.service.peers[peer["id"]] = dict(peer, seen=0, deviceType="desktop")
+        first_chunk = asyncio.Event()
+        continue_upload = asyncio.Event()
+
+        async def stalled_chunks(path, transfer):
+            yield b"x" * 1024
+            transfer["bytes"] += 1024
+            first_chunk.set()
+            await continue_upload.wait()
+            yield path.read_bytes()[1024:]
+            transfer["bytes"] += path.stat().st_size - 1024
+
+        async def monitor_progress():
+            while not sending.done():
+                await asyncio.sleep(0.01)
+                await self.service.expire_stalled_transfers()
+
+        with patch.object(omadrop, "TRANSFER_IDLE_TIMEOUT", 0.05), patch.object(
+            self.service, "local_send_chunks", stalled_chunks
+        ):
+            sending = self.service.spawn(
+                self.service.send_files(peer, [str(source)], "stalled-outbound")
+            )
+            sending.set_name("stalled-outbound")
+            monitor = None
+            try:
+                for _ in range(100):
+                    if receiver.incoming:
+                        break
+                    await asyncio.sleep(0.01)
+                self.assertTrue(receiver.incoming)
+                next(iter(receiver.incoming.values()))["decision"].set_result(True)
+                await asyncio.wait_for(first_chunk.wait(), 2)
+                monitor = asyncio.create_task(monitor_progress())
+                for _ in range(100):
+                    if list(Path(receiver.settings["directory"]).glob(".omadrop-*.part")):
+                        break
+                    await asyncio.sleep(0.01)
+                self.assertTrue(
+                    list(Path(receiver.settings["directory"]).glob(".omadrop-*.part"))
+                )
+                await asyncio.wait_for(monitor, 2)
+                continue_upload.set()
+                await asyncio.gather(sending, return_exceptions=True)
+                await asyncio.sleep(0.05)
+                self.assertFalse(receiver.sessions)
+                self.assertFalse(
+                    list(Path(receiver.settings["directory"]).glob(".omadrop-*.part"))
+                )
+            finally:
+                continue_upload.set()
+                if monitor is not None and not monitor.done():
+                    monitor.cancel()
+                    await asyncio.gather(monitor, return_exceptions=True)
+                await receiver.stop()
+
+        transfer = self.service.transfers["stalled-outbound"]
+        self.assertEqual(transfer["state"], "failed")
+        self.assertIn("without progress", transfer["error"])
+        self.assertFalse(receiver.sessions)
+        self.assertFalse(
+            list(Path(receiver.settings["directory"]).glob(".omadrop-*.part"))
+        )
 
     async def test_unsafe_quickshare_filename_is_rejected_before_consent(self):
         actions = []

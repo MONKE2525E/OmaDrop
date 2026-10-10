@@ -68,22 +68,87 @@ class AirDropTests(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(omadrop.Coordinator().settings["enabled"])
                 self.assertTrue(all(row["state"] == "stopped" for row in service.channels.values()))
 
-    async def test_running_receiver_with_failed_radio_is_repaired(self):
-        with tempfile.TemporaryDirectory(prefix="omadrop-radio-recovery-") as temp:
+    async def test_airdrop_preserves_existing_receiver_ownership_and_visibility(self):
+        for visible in (False, True):
+            with self.subTest(visible=visible), tempfile.TemporaryDirectory(
+                prefix="omadrop-external-radio-"
+            ) as temp:
+                with patch.dict(os.environ, {"OMADROP_CONFIG_DIR": temp}):
+                    service = omadrop.Coordinator()
+                status = (
+                    '{"receiving":true,"visible":'
+                    + ("true" if visible else "false")
+                    + "}"
+                )
+                command = AsyncMock(
+                    side_effect=[status, status] + (["[]"] if visible else [])
+                )
+                with patch.object(
+                    omadrop.shutil, "which", return_value="/bin/omdrop"
+                ), patch.object(omadrop, "run_command", new=command):
+                    await service.start_airdrop()
+                    await service.stop()
+                self.assertFalse(service.airdrop_owned)
+                self.assertNotIn(
+                    ("omdrop", "on", "forever"),
+                    [call.args[:3] for call in command.await_args_list],
+                )
+                self.assertNotIn(
+                    ("omdrop", "off"),
+                    [call.args[:2] for call in command.await_args_list],
+                )
+                self.assertEqual(
+                    service.channels["airdrop"]["state"], "stopped"
+                )
+                if visible:
+                    self.assertEqual(len(command.await_args_list), 3)
+                else:
+                    self.assertEqual(len(command.await_args_list), 2)
+
+    async def test_airdrop_takes_ownership_only_after_successful_start(self):
+        for visible in (False, True):
+            with self.subTest(visible=visible), tempfile.TemporaryDirectory(
+                prefix="omadrop-radio-start-"
+            ) as temp:
+                with patch.dict(os.environ, {"OMADROP_CONFIG_DIR": temp}):
+                    service = omadrop.Coordinator()
+                before = (
+                    '{"receiving":false,"visible":'
+                    + ("true" if visible else "false")
+                    + "}"
+                )
+                command = AsyncMock(side_effect=[
+                    before, "", "", '{"receiving":true,"visible":true}',
+                    "[]", "",
+                ])
+                with patch.object(
+                    omadrop.shutil, "which", return_value="/bin/omdrop"
+                ), patch.object(omadrop, "run_command", new=command):
+                    await service.start_airdrop()
+                    self.assertTrue(service.airdrop_owned)
+                    await service.stop()
+                command.assert_any_await("omdrop", "on", "forever", timeout=30)
+                command.assert_any_await("omdrop", "off", timeout=20)
+
+    async def test_failed_airdrop_start_does_not_claim_or_stop_external_receiver(self):
+        with tempfile.TemporaryDirectory(prefix="omadrop-radio-failure-") as temp:
             with patch.dict(os.environ, {"OMADROP_CONFIG_DIR": temp}):
                 service = omadrop.Coordinator()
-            service.airdrop_owned = True
             command = AsyncMock(side_effect=[
-                '{"receiving":true,"visible":false}', "",
-                '{"receiving":true,"visible":true}', "[]",
+                '{"receiving":false,"visible":false}', "",
+                RuntimeError("radio failed"),
             ])
-            with patch.object(omadrop.shutil, "which", return_value="/bin/omdrop"), patch.object(
-                omadrop, "run_command", new=command
-            ):
-                await service.start_airdrop()
-            command.assert_any_await("omdrop", "on", "forever", timeout=30)
-            self.assertTrue(service.airdrop_owned)
-            self.assertEqual(service.channels["airdrop"]["state"], "advertising")
+            with patch.object(
+                omadrop.shutil, "which", return_value="/bin/omdrop"
+            ), patch.object(omadrop, "run_command", new=command):
+                with self.assertRaisesRegex(RuntimeError, "radio failed"):
+                    await service.start_airdrop()
+                self.assertFalse(service.airdrop_owned)
+                await service.stop()
+            self.assertNotIn(
+                ("omdrop", "off"),
+                [call.args[:2] for call in command.await_args_list],
+            )
 
     async def test_unready_radio_refreshes_reason_without_starting(self):
         with tempfile.TemporaryDirectory(prefix="omadrop-retry-test-") as temp:

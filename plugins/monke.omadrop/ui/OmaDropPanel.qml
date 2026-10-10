@@ -28,6 +28,9 @@ Panel {
 
   // Shipped beside this file so the widget works without anything on PATH.
   readonly property string cli: Qt.resolvedUrl("../bin/omadrop").toString().replace("file://", "")
+  // Each bar instance owns a separate lease, including panels on other monitors.
+  readonly property string leaseId: "panel-" + Date.now().toString(36) + "-"
+    + Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2)
 
   readonly property color foreground: bar ? bar.foreground : Color.foreground
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
@@ -232,13 +235,13 @@ Panel {
 
   function renewLease() {
     if (leaseProc.running || !leaseWanted) return
-    leaseProc.command = [cli, "lease", "--seconds", "30"]
+    leaseProc.command = [cli, "lease", "--seconds", "30", "--lease-id", leaseId]
     leaseProc.running = true
   }
 
   function releaseLease() {
     if (leaseProc.running) { releasePending = true; return }
-    leaseProc.command = [cli, "release"]
+    leaseProc.command = [cli, "release", "--lease-id", leaseId]
     leaseProc.running = true
   }
 

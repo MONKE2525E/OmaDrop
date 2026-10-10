@@ -40,6 +40,13 @@ PORT = 53317
 QUICK_PORT = 53318
 API = "/api/localsend/v2"
 ACTIVE_STATES = {"preparing", "waiting", "transferring"}
+LOCALSEND_SESSION_IDLE_TIMEOUT = 600
+LOCALSEND_UPLOAD_IDLE_TIMEOUT = 300
+LOCALSEND_RESPONSE_IDLE_TIMEOUT = 300
+LOCALSEND_CHUNK_SIZE = 256 * 1024
+TRANSFER_IDLE_TIMEOUT = 300
+MAX_MENU_LEASES = 64
+LEGACY_MENU_LEASE_ID = "legacy"
 
 
 class RecipientRejected(RuntimeError):
@@ -75,6 +82,20 @@ class Transfer(dict):
     def update(self, *args, **kwargs):
         super().update(*args, **kwargs)
         super().__setitem__("updated", time.time())
+
+
+def menu_lease_id(packet):
+    if "leaseId" not in packet:
+        return LEGACY_MENU_LEASE_ID
+    lease_id = packet["leaseId"]
+    if (
+        not isinstance(lease_id, str)
+        or not 1 <= len(lease_id) <= 64
+        or lease_id == LEGACY_MENU_LEASE_ID
+        or any(not (char.isascii() and (char.isalnum() or char in "_-")) for char in lease_id)
+    ):
+        raise ValueError("Invalid menu lease ID")
+    return lease_id
 
 
 async def lan_addresses():
@@ -379,7 +400,7 @@ class Coordinator:
         self.airdrop_owned = False
         self.airdrop_names = None
         self.window_timer = None
-        self.menu_until = 0
+        self.menu_leases = {}
         self.outgoing_files = {}
         self.transfer_watch = {}
         self.client = None
@@ -452,6 +473,7 @@ class Coordinator:
 
     def snapshot(self):
         now = time.monotonic()
+        active_menu = self.active_menu_leases(time.time())
         # LocalSend has no departure packet. Expire stale announcements.
         stale = [
             key
@@ -472,7 +494,7 @@ class Coordinator:
         return {
             "running": self.running,
             "mode": "window" if self.settings.get("advertiseUntil", 0) > time.time()
-            else "menu" if self.menu_until > time.time() else "off",
+            else "menu" if active_menu else "off",
             "remainingSeconds": max(0, int(self.settings["advertiseUntil"] - time.time()))
             if self.settings.get("advertiseUntil", 0) > time.time() else None,
             "name": self.settings["name"],
@@ -511,16 +533,26 @@ class Coordinator:
             self.window_timer.cancel()
         self.window_timer = asyncio.create_task(self.expire_window())
 
+    def active_menu_leases(self, now=None):
+        now = time.time() if now is None else now
+        for lease_id, expires in list(self.menu_leases.items()):
+            if expires <= now:
+                self.menu_leases.pop(lease_id, None)
+        return self.menu_leases
+
+    def window_deadline(self):
+        menu_deadline = max(self.active_menu_leases().values(), default=0)
+        return max(self.settings.get("advertiseUntil", 0), menu_deadline)
+
     async def expire_window(self):
-        await asyncio.sleep(max(0, max(self.settings.get("advertiseUntil", 0), self.menu_until) - time.time()))
+        await asyncio.sleep(max(0, self.window_deadline() - time.time()))
         async with self.lock:
             self.window_timer = None
             if self.settings.get("advertiseUntil", 0) <= time.time():
                 self.settings.update(enabled=False, advertiseUntil=0)
                 save_settings(self.settings)
-            if self.menu_until <= time.time():
-                self.menu_until = 0
-            if self.menu_until or self.settings.get("advertiseUntil", 0):
+            self.active_menu_leases()
+            if self.menu_leases or self.settings.get("advertiseUntil", 0):
                 self.arm_window()
             else:
                 await self.stop()
@@ -535,7 +567,7 @@ class Coordinator:
 
     async def stop(self):
         self.running = False
-        self.menu_until = 0
+        self.menu_leases.clear()
         if self.window_timer is not None:
             self.window_timer.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -840,7 +872,7 @@ class Coordinator:
             "files": items,
             "host": request.remote,
             "directory": folder,
-            "expires": time.monotonic() + 600,
+            "expires": time.monotonic() + LOCALSEND_SESSION_IDLE_TIMEOUT,
             "cancelled": False,
         }
         self.transfers[request_id] = Transfer({
@@ -889,16 +921,26 @@ class Coordinator:
         try:
             with temporary.open("xb") as target:
                 temporary.chmod(0o600)
-                async with asyncio.timeout(300):
-                    async for chunk in request.content.iter_chunked(256 * 1024):
-                        if session["cancelled"]:
-                            raise web.HTTPForbidden(text="Cancelled")
-                        count += len(chunk)
-                        if count > entry["size"]:
-                            raise web.HTTPBadRequest(text="File larger than announced")
-                        target.write(chunk)
-                        digest.update(chunk)
-                        transfer["bytes"] += len(chunk)
+                chunks = request.content.iter_chunked(LOCALSEND_CHUNK_SIZE).__aiter__()
+                while True:
+                    try:
+                        async with asyncio.timeout(LOCALSEND_UPLOAD_IDLE_TIMEOUT):
+                            chunk = await anext(chunks)
+                    except StopAsyncIteration:
+                        break
+                    except TimeoutError as error:
+                        raise web.HTTPRequestTimeout(text="Upload stalled") from error
+                    if session["cancelled"]:
+                        raise web.HTTPForbidden(text="Cancelled")
+                    count += len(chunk)
+                    if count > entry["size"]:
+                        raise web.HTTPBadRequest(text="File larger than announced")
+                    target.write(chunk)
+                    digest.update(chunk)
+                    transfer["bytes"] += len(chunk)
+                    session["expires"] = (
+                        time.monotonic() + LOCALSEND_SESSION_IDLE_TIMEOUT
+                    )
             if count != entry["size"] or (
                 entry["sha256"] and digest.hexdigest() != entry["sha256"]
             ):
@@ -940,6 +982,17 @@ class Coordinator:
         self.transfers[session_id]["state"] = "cancelled"
         self.sessions.pop(session_id, None)
         return web.Response()
+
+    def expire_localsend_sessions(self, now=None):
+        now = time.monotonic() if now is None else now
+        for key, session in list(self.sessions.items()):
+            if session["expires"] >= now:
+                continue
+            session["cancelled"] = True
+            self.sessions.pop(key, None)
+            transfer = self.transfers.get(key)
+            if transfer and transfer["state"] in ACTIVE_STATES:
+                transfer.update(state="failed", error="Transfer timed out")
 
     async def start_quick(self):
         if not os.access(self.quick_path, os.X_OK):
@@ -1244,10 +1297,8 @@ class Coordinator:
         # Do not take ownership of a receiver another application started.
         if not before.get("receiving"):
             await run_command("omdrop", "dir", self.settings["directory"])
-        if not before.get("receiving") or before.get("visible") is not True:
             await run_command("omdrop", "on", "forever", timeout=30)
-            if not before.get("receiving"):
-                self.airdrop_owned = True
+            self.airdrop_owned = True
         await self.poll_airdrop()
 
     async def poll_airdrop(self):
@@ -1326,13 +1377,7 @@ class Coordinator:
             async with self.lock:
                 if self.running:
                     await self.refresh_airdrop()
-            for key, session in list(self.sessions.items()):
-                if session["expires"] < time.monotonic():
-                    session["cancelled"] = True
-                    self.sessions.pop(key, None)
-                    self.transfers[key].update(
-                        state="failed", error="Transfer timed out"
-                    )
+            self.expire_localsend_sessions()
 
     async def housekeeping(self):
         while True:
@@ -1365,7 +1410,7 @@ class Coordinator:
             if previous != progress:
                 last_progress = now
             self.transfer_watch[key] = (progress, last_progress)
-            if now - last_progress < 300:
+            if now - last_progress < TRANSFER_IDLE_TIMEOUT:
                 continue
             tasks = [task for task in self.tasks if task.get_name() == key]
             for task in tasks:
@@ -1378,7 +1423,10 @@ class Coordinator:
                     ), 5)
             if key in self.sessions:
                 self.sessions[key]["cancelled"] = True
-            transfer.update(state="failed", error="Transfer timed out after 5 minutes without progress")
+            transfer.update(
+                state="failed",
+                error="Transfer timed out after 5 minutes without progress",
+            )
             cleanup_sent_files(self.outgoing_files.pop(key, []))
             self.transfer_watch.pop(key, None)
 
@@ -1465,12 +1513,6 @@ class Coordinator:
             for file_id, token in session["files"].items():
                 path = Path(files[int(file_id)])
 
-                async def chunks():
-                    with path.open("rb") as source:
-                        while data := source.read(256 * 1024):
-                            yield data
-                            transfer["bytes"] += len(data)
-
                 query = {
                     "sessionId": session["sessionId"],
                     "fileId": file_id,
@@ -1479,13 +1521,13 @@ class Coordinator:
                 async with self.client.post(
                     self.remote_url(peer, "upload"),
                     params=query,
-                    data=chunks(),
+                    data=self.local_send_chunks(path, transfer),
                     ssl=self.remote_tls(peer),
                     headers={
                         "Content-Type": "application/octet-stream",
                         "Content-Length": str(path.stat().st_size),
                     },
-                    timeout=aiohttp.ClientTimeout(total=600, connect=5),
+                    timeout=self.local_send_timeout(),
                 ) as response:
                     if response.status != 200:
                         raise RuntimeError(f"Upload failed ({response.status})")
@@ -1514,6 +1556,19 @@ class Coordinator:
             if peer["protocol"] != "quickshare" or not quick_dispatched:
                 cleanup_sent_files(files)
                 self.outgoing_files.pop(transfer_id, None)
+
+    async def local_send_chunks(self, path, transfer):
+        with path.open("rb") as source:
+            while data := source.read(LOCALSEND_CHUNK_SIZE):
+                yield data
+                transfer["bytes"] += len(data)
+
+    def local_send_timeout(self):
+        return aiohttp.ClientTimeout(
+            total=None,
+            connect=5,
+            sock_read=LOCALSEND_RESPONSE_IDLE_TIMEOUT,
+        )
 
     async def action(self, request):
         packet = await request.json()
@@ -1597,14 +1652,22 @@ class Coordinator:
                     duration = packet.get("durationSeconds", 30)
                     if type(duration) is not int or not 5 <= duration <= 120:
                         raise ValueError("Menu lease must be 5–120 seconds")
+                    lease_id = menu_lease_id(packet)
+                    self.active_menu_leases()
+                    if (
+                        lease_id not in self.menu_leases
+                        and len(self.menu_leases) >= MAX_MENU_LEASES
+                    ):
+                        raise ValueError("Too many active menu leases")
                     if not self.running:
                         await self.start()
-                    self.menu_until = max(self.menu_until, time.time() + duration)
+                    self.menu_leases[lease_id] = time.time() + duration
                     self.arm_window()
             elif command == "release":
                 async with self.lock:
-                    self.menu_until = 0
-                    if self.settings.get("advertiseUntil", 0) > time.time():
+                    self.menu_leases.pop(menu_lease_id(packet), None)
+                    self.active_menu_leases()
+                    if self.menu_leases or self.settings.get("advertiseUntil", 0) > time.time():
                         self.arm_window()
                     else:
                         self.settings.update(enabled=False, advertiseUntil=0)
@@ -1820,6 +1883,8 @@ async def cli(args):
         packet["command"] = args.command
     if args.command in ("start", "lease"):
         packet["durationSeconds"] = args.seconds
+    if args.command in ("lease", "release") and args.lease_id is not None:
+        packet["leaseId"] = args.lease_id
     if args.command in ("accept", "reject", "cancel", "dismiss"):
         packet["id"] = args.id
     if args.command == "send":
@@ -1876,6 +1941,12 @@ def main():
         )
         if command in ("start", "lease"):
             command_parser.add_argument("--seconds", type=int, default=600 if command == "start" else 30)
+        if command in ("lease", "release"):
+            command_parser.add_argument(
+                "--lease-id",
+                dest="lease_id",
+                help="Scope a menu lease to this caller; without it, use the shared legacy lease",
+            )
     for command in ("accept", "reject", "cancel", "dismiss"):
         sub.add_parser(command).add_argument("id")
     send = sub.add_parser("send")
