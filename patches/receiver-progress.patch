@@ -1,6 +1,60 @@
 --- a/bin/airdrop-serve.py
 +++ b/bin/airdrop-serve.py
-@@ -596,6 +596,7 @@
+@@ -368,7 +368,7 @@
+     return 'length', length
+ 
+ 
+-def _copy_exact(source, writer, size, truncated, deadline):
++def _copy_exact(source, writer, size, truncated, deadline, on_chunk=None):
+     # read1 hands back whatever has arrived rather than waiting for a full
+     # chunk, so a stalled body is counted to the byte instead of to the last
+     # complete 64 KiB it managed.
+@@ -380,10 +380,12 @@
+             raise RequestBodyError(truncated)
+         deadline.note(len(data))
+         writer.write(data)
++        if on_chunk is not None:
++            on_chunk()
+         left -= len(data)
+ 
+ 
+-def _read_chunked(rfile, writer, deadline):
++def _read_chunked(rfile, writer, deadline, on_chunk=None):
+     while True:
+         line = rfile.readline(MAX_CHUNK_LINE_BYTES + 1)
+         deadline.note(len(line))
+@@ -410,7 +412,8 @@
+         if size > writer.remaining:
+             raise BodyTooLarge(
+                 f'request body exceeds {writer.limit}-byte limit')
+-        _copy_exact(rfile, writer, size, 'truncated chunk data', deadline)
++        _copy_exact(rfile, writer, size, 'truncated chunk data', deadline,
++                    on_chunk=on_chunk)
+         ending = rfile.read(2)
+         deadline.note(len(ending))
+         if ending != b'\r\n':
+@@ -418,16 +421,17 @@
+ 
+ 
+ def read_request_body(rfile, headers, target, limit, *, check_disk=False,
+-                      plan=None, deadline=None):
++                      plan=None, deadline=None, on_chunk=None):
+     """Stream one framed request body into target under byte and time limits."""
+     mode, length = plan or body_plan(headers, limit)
+     deadline = deadline or ReadDeadline()
+     writer = LimitedWriter(target, limit, 'request body', BodyTooLarge,
+                            check_disk)
+     if mode == 'chunked':
+-        _read_chunked(rfile, writer, deadline)
++        _read_chunked(rfile, writer, deadline, on_chunk=on_chunk)
+     else:
+-        _copy_exact(rfile, writer, length, 'truncated request body', deadline)
++        _copy_exact(rfile, writer, length, 'truncated request body', deadline,
++                    on_chunk=on_chunk)
+     return writer.total
+ 
+ 
+@@ -596,9 +600,13 @@
                          sink = ExtractedFileWriter(output, budget, name)
                          for block in entry.get_blocks():
                              sink.write(block)
@@ -8,7 +62,13 @@
                      written.append(name)
              if consent['expected']:
                  raise ValueError('Archive omitted approved files')
-@@ -861,18 +862,23 @@
++            # Keep final reporting inside this rollback scope so cancellation
++            # removes files already extracted by this request.
++            airdrop_consent.report(consent, 'complete')
+     except Exception:
+         for name in reversed(created):
+             try:
+@@ -858,19 +866,24 @@
          # An Upload that never passed an Ask has nothing vouching for it, and
          # the Upload itself carries no validation record to judge.
          if contacts.visibility() == 'contacts' and not getattr(self, '_contacts_ok', False):
@@ -32,7 +92,16 @@
 +            airdrop_consent.report(consent)
              receive_budget = ReceiveBudget(DEST, MAX_RECEIVE_PERCENT)
              plan = body_plan(self.headers, receive_budget.byte_limit)
-@@ -892,6 +898,7 @@
+             logging.info(
+@@ -883,12 +896,14 @@
+             with tempfile.TemporaryFile(dir=DEST) as raw:
+                 wire_bytes = read_request_body(
+                     self.rfile, self.headers, raw, receive_budget.byte_limit,
+-                    check_disk=True, plan=plan, deadline=deadline)
++                    check_disk=True, plan=plan, deadline=deadline,
++                    on_chunk=lambda: airdrop_consent.report(consent))
+                 raw.seek(0)
+                 logging.info('upload %s: %d bytes dvzip (TotalBytes %s)',
                               tid, wire_bytes, self.headers.get('TotalBytes'))
                  written = store_upload(raw, DEST, tid, receive_budget, consent)
              logging.info('upload %s: stored %s', tid, ', '.join(written))
@@ -40,12 +109,13 @@
          except socket.timeout as e:
              # Chunked framing announces no length, so there is none to name.
              expected = plan[1] if plan else None
-@@ -910,6 +917,7 @@
+@@ -907,7 +922,8 @@
              self.reject(422, f'upload is not a valid bounded DVZip archive: {e}')
              return
          finally:
+-            UPLOAD_SLOTS.release()
 +            airdrop_consent.finish_upload(
 +                consent, 'complete' if completed else 'failed', UPLOAD_SLOTS.release)
--            UPLOAD_SLOTS.release()
          self.send_response(200)
          self.send_header('Content-Length', '0')
+         self.end_headers()

@@ -105,3 +105,25 @@ class ConsentTests(unittest.TestCase):
                 self.assertEqual(report.call_count, 2)
             self.assertTrue(slots.acquire(blocking=False))
             slots.release()
+
+    def test_progress_rejection_aborts_the_upload(self):
+        grant = {"id": "airdrop:test", "token": "token", "bytes": 12, "reported": 0}
+        result = types.SimpleNamespace(
+            returncode=1, stdout='{"error":"Receive session cancelled"}'
+        )
+        with patch.object(consent.subprocess, "run", return_value=result):
+            with self.assertRaisesRegex(ValueError, "Receive session cancelled"):
+                consent.report(grant, count=4)
+        self.assertEqual(grant["bytes"], 16)
+
+    def test_successful_terminal_report_is_not_sent_twice_when_releasing_slot(self):
+        grant = {"id": "airdrop:test", "token": "token", "bytes": 12, "reported": 0}
+        result = types.SimpleNamespace(returncode=0, stdout='{}')
+        with patch.object(consent.subprocess, "run", return_value=result) as run:
+            consent.report(grant, "complete")
+            slots = threading.BoundedSemaphore(1)
+            self.assertTrue(slots.acquire(blocking=False))
+            consent.finish_upload(grant, "complete", slots.release)
+            self.assertEqual(run.call_count, 1)
+            self.assertTrue(slots.acquire(blocking=False))
+            slots.release()

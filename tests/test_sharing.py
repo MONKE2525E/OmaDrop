@@ -207,6 +207,67 @@ class LocalSendTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.service.transfers[key]["state"], "cancelled")
         self.assertEqual(unrelated.read_bytes(), b"keep")
 
+    async def test_quickshare_dispatch_failure_cleans_only_staged_inputs(self):
+        runtime = Path(self.temp.name) / "runtime"
+        runtime.mkdir(mode=0o700)
+        clipboard = runtime / "clipboard"
+        failed_dir = clipboard / "clipboard-failed"
+        unrelated_dir = clipboard / "clipboard-other"
+        failed_dir.mkdir(parents=True)
+        unrelated_dir.mkdir()
+        original = Path(self.temp.name) / "original.jpg"
+        staged = failed_dir / "clipboard.jpg"
+        unrelated = unrelated_dir / "other.jpg"
+        original.write_bytes(b"original")
+        staged.write_bytes(b"staged clipboard copy")
+        unrelated.write_bytes(b"unrelated staged copy")
+        key = "quickshare:dispatch-failed"
+        peer = {
+            "protocol": "quickshare", "name": "Test phone",
+            "host": "127.0.0.1", "port": 12345,
+        }
+
+        with patch.dict(os.environ, {"OMADROP_RUNTIME_DIR": str(runtime)}), patch.object(
+            self.service, "quick_write", new=AsyncMock(side_effect=RuntimeError("bridge stopped"))
+        ):
+            await self.service.send_files(peer, [str(original), str(staged)], key)
+
+        self.assertEqual(self.service.transfers[key]["state"], "failed")
+        self.assertNotIn(key, self.service.outgoing_files)
+        self.assertTrue(original.exists())
+        self.assertFalse(staged.exists())
+        self.assertEqual(unrelated.read_bytes(), b"unrelated staged copy")
+
+    async def test_quickshare_success_keeps_staged_inputs_until_engine_event(self):
+        runtime = Path(self.temp.name) / "runtime"
+        runtime.mkdir(mode=0o700)
+        stage_dir = runtime / "clipboard" / "clipboard-success"
+        stage_dir.mkdir(parents=True)
+        original = Path(self.temp.name) / "original.txt"
+        staged = stage_dir / "clipboard.txt"
+        original.write_text("user original")
+        staged.write_text("staged copy")
+        key = "quickshare:dispatch-success"
+        peer = {
+            "protocol": "quickshare", "name": "Test phone",
+            "host": "127.0.0.1", "port": 12345,
+        }
+
+        with patch.dict(os.environ, {"OMADROP_RUNTIME_DIR": str(runtime)}), patch.object(
+            self.service, "quick_write", new=AsyncMock()
+        ):
+            await self.service.send_files(peer, [str(original), str(staged)], key)
+            self.assertIn(key, self.service.outgoing_files)
+            self.assertTrue(staged.exists())
+            self.service.quick_transfer({
+                "id": "dispatch-success", "rtype": "Outbound", "state": "Finished",
+                "meta": {"source": {"name": "Test phone"}, "files": [staged.name]},
+            })
+
+        self.assertNotIn(key, self.service.outgoing_files)
+        self.assertTrue(original.exists())
+        self.assertFalse(staged.exists())
+
     async def test_airdrop_progress_requires_approved_session_token(self):
         task = asyncio.create_task(self.control.post("/", json={
             "command": "receive-request", "peer": "Test Mac", "files": [{"name": "test.txt", "size": 4}],
@@ -231,6 +292,32 @@ class LocalSendTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.service.transfers[key]["state"], "complete")
         response = await self.control.post("/", json=packet)
         self.assertEqual(response.status, 400)
+
+    async def test_cancel_airdrop_revokes_progress_and_receiver_poll_is_rejected(self):
+        request = asyncio.create_task(self.control.post("/", json={
+            "command": "receive-request", "peer": "Test Mac",
+            "files": [{"name": "test.txt", "size": 4}],
+        }))
+        for _ in range(100):
+            if self.service.incoming:
+                break
+            await asyncio.sleep(0.01)
+        key = next(iter(self.service.incoming))
+        await self.control.post("/", json={"command": "accept", "id": key})
+        approval = await (await request).json()
+        self.assertIn(key, self.service.airdrop_progress)
+
+        response = await self.control.post("/", json={"command": "cancel", "id": key})
+        self.assertEqual(response.status, 200)
+        self.assertEqual(self.service.transfers[key]["state"], "cancelled")
+        self.assertNotIn(key, self.service.airdrop_progress)
+
+        response = await self.control.post("/", json={
+            "command": "receive-progress", "id": key, "token": approval["token"],
+            "bytes": 1, "state": "transferring",
+        })
+        self.assertEqual(response.status, 400)
+        self.assertEqual((await response.json())["error"], "Receive session cancelled")
 
     async def test_airdrop_websites_open_only_after_approval_and_once(self):
         url = "https://example.test/?literal=$(no-shell)"
@@ -465,6 +552,54 @@ class LocalSendTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(response.status, 200)
         self.assertEqual((await self.upload(session, b"hello")).status, 403)
         self.assertEqual(self.service.transfers[request_id]["state"], "cancelled")
+
+    async def test_cancelled_localsend_sessions_do_not_consume_the_session_limit(self):
+        for _ in range(20):
+            task, request_id = await self.prepare()
+            await self.approve(task, request_id)
+            self.assertIn(request_id, self.service.sessions)
+            response = await self.control.post(
+                "/", json={"command": "cancel", "id": request_id}
+            )
+            self.assertEqual(response.status, 200)
+            self.assertNotIn(request_id, self.service.sessions)
+            self.assertEqual(self.service.transfers[request_id]["state"], "cancelled")
+
+    async def test_localsend_cancel_during_upload_removes_only_its_partial_file(self):
+        task, request_id = await self.prepare()
+        session = await self.approve(task, request_id)
+        first_chunk_sent = asyncio.Event()
+        send_rest = asyncio.Event()
+
+        async def chunks():
+            yield b"he"
+            first_chunk_sent.set()
+            await send_rest.wait()
+            yield b"llo"
+
+        upload = asyncio.create_task(self.upload(session, chunks()))
+        try:
+            await asyncio.wait_for(first_chunk_sent.wait(), 2)
+            for _ in range(100):
+                partials = list(self.directory.glob(".omadrop-*.part"))
+                if partials:
+                    break
+                await asyncio.sleep(0.01)
+            self.assertEqual(len(partials), 1)
+
+            response = await self.control.post(
+                "/", json={"command": "cancel", "id": request_id}
+            )
+            self.assertEqual(response.status, 200)
+            self.assertNotIn(request_id, self.service.sessions)
+        finally:
+            send_rest.set()
+
+        response = await asyncio.wait_for(upload, 3)
+        self.assertEqual(response.status, 403)
+        self.assertEqual(self.service.transfers[request_id]["state"], "cancelled")
+        self.assertFalse(list(self.directory.glob(".omadrop-*.part")))
+        self.assertFalse((self.directory / "test.txt").exists())
 
     async def test_stop_with_pending_quickshare_consent(self):
         self.service.incoming["quickshare:test"] = {"decision": None, "public": {}}

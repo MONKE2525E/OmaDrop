@@ -167,17 +167,27 @@ def report(grant, state="transferring", count=0):
     try:
         result = subprocess.run([str(Path.home() / ".local/bin/omadrop"), "receive-progress"],
                                 input=json.dumps(packet), capture_output=True, text=True, timeout=15 if state == "complete" else 2)
-        if state == "complete" and (result.returncode or json.loads(result.stdout).get("error")):
-            raise ValueError("Could not finish the approved transfer")
-    except (OSError, subprocess.TimeoutExpired) as error:
+        try:
+            response = json.loads(result.stdout)
+        except (TypeError, ValueError):
+            response = None
+        error = response.get("error") if isinstance(response, dict) else None
+        if state in ("transferring", "complete") and (
+            result.returncode or response is None or error
+        ):
+            raise ValueError(str(error or "Could not report AirDrop upload progress")[:240])
         if state == "complete":
-            raise ValueError("Could not finish the approved transfer") from error
+            grant["complete_reported"] = True
+    except (OSError, subprocess.TimeoutExpired) as error:
+        if state in ("transferring", "complete"):
+            raise ValueError("Could not report AirDrop upload progress") from error
         logging.warning("AirDrop receive progress could not be reported")
 
 
 def finish_upload(grant, state, release_slot):
     """Report the terminal state and release the bounded receiver slot."""
     try:
-        report(grant, state)
+        if state != "complete" or not grant.get("complete_reported"):
+            report(grant, state)
     finally:
         release_slot()

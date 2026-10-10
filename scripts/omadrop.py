@@ -1410,6 +1410,7 @@ class Coordinator:
             transfer = self.outgoing_transfer(peer, files, transfer_id)
             self.transfers[transfer_id] = transfer
         total = transfer["total"]
+        quick_dispatched = False
         try:
             if peer["protocol"] == "quickshare":
                 await self.quick_write(
@@ -1421,6 +1422,7 @@ class Coordinator:
                         "files": files,
                     }
                 )
+                quick_dispatched = True
                 return
             if peer["protocol"] == "airdrop":
                 transfer["state"] = "transferring"
@@ -1499,7 +1501,7 @@ class Coordinator:
         except Exception as error:
             transfer.update(state="failed", error=str(error)[:240])
         finally:
-            if peer["protocol"] != "quickshare":
+            if peer["protocol"] != "quickshare" or not quick_dispatched:
                 cleanup_sent_files(files)
                 self.outgoing_files.pop(transfer_id, None)
 
@@ -1544,10 +1546,14 @@ class Coordinator:
                 return web.json_response({"accepted": True, "transferId": key, "token": token})
             elif command == "receive-progress":
                 key = packet["id"]
+                transfer = self.transfers.get(key)
+                if transfer and transfer["state"] == "cancelled":
+                    raise ValueError("Receive session cancelled")
                 grant = self.airdrop_progress.get(key)
                 if not grant or grant["expires"] < time.monotonic() or not secrets.compare_digest(grant["token"], str(packet.get("token", ""))):
                     raise ValueError("Receive session expired")
-                transfer = self.transfers[key]
+                if transfer is None:
+                    raise ValueError("Receive session expired")
                 state, count = packet["state"], packet["bytes"]
                 if transfer["state"] not in ACTIVE_STATES:
                     raise ValueError("Receive session finished")
@@ -1642,12 +1648,20 @@ class Coordinator:
                         {"action": "CancelTransfer", "id": key.split(":", 1)[1]}
                     )
                 elif key in self.sessions:
-                    self.sessions[key]["cancelled"] = True
+                    session = self.sessions[key]
+                    session["cancelled"] = True
+                    self.sessions.pop(key)
+                elif key.startswith("airdrop:"):
+                    self.airdrop_progress.pop(key, None)
                 else:
                     for task in self.tasks:
                         if task.get_name() == key:
                             task.cancel()
-                if key in self.transfers and not key.startswith("quickshare:"):
+                if (
+                    key in self.transfers
+                    and not key.startswith("quickshare:")
+                    and self.transfers[key]["state"] in ACTIVE_STATES
+                ):
                     self.transfers[key]["state"] = "cancelled"
             elif command == "send":
                 peer = self.peers.get(packet["peer"])
