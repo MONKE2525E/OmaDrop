@@ -1,0 +1,77 @@
+{
+ "running": true,
+ "mode": "window",
+ "remainingSeconds": 537,
+ "name": "omarchy-desktop",
+ "directory": "/home/monke/Downloads",
+ "error": "",
+ "protocols": [
+  {
+   "id": "airdrop",
+   "name": "AirDrop",
+   "state": "advertising",
+   "reason": ""
+  },
+  {
+   "id": "quickshare",
+   "name": "Quick Share",
+   "state": "advertising",
+   "reason": ""
+  },
+  {
+   "id": "localsend",
+   "name": "LocalSend",
+   "state": "advertising",
+   "reason": ""
+  }
+ ],
+ "peers": [],
+ "incoming": [
+  {
+   "id": "i1",
+   "name": "Pixel 9",
+   "protocol": "quickshare",
+   "kind": "url",
+   "description": "example.org/article",
+   "files": [
+    {
+     "name": "website.txt",
+     "size": 42
+    }
+   ],
+   "totalSize": 42,
+   "pin": null,
+   "expiresIn": 95
+  },
+  {
+   "id": "i2",
+   "name": "Studio Mac",
+   "protocol": "airdrop",
+   "kind": "file",
+   "files": [
+    {
+     "name": "holiday-photo-0001.jpg",
+     "size": 4200000
+    }
+   ],
+   "totalSize": 4200000,
+   "pin": null
+  }
+ ],
+ "transfers": [
+  {
+   "id": "t1",
+   "name": "notes.pdf",
+   "peer": "Pixel 9",
+   "protocol": "quickshare",
+   "direction": "in",
+   "bytes": 1300000,
+   "total": 5000000,
+   "state": "transferring",
+   "error": "",
+   "files": 1,
+   "fileName": "notes.pdf",
+   "updated": 0
+  }
+ ]
+}

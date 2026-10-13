@@ -1,0 +1,107 @@
+{
+ "running": true,
+ "mode": "menu",
+ "remainingSeconds": null,
+ "name": "omarchy-desktop",
+ "directory": "/home/monke/Downloads",
+ "error": "",
+ "protocols": [
+  {
+   "id": "airdrop",
+   "name": "AirDrop",
+   "state": "advertising",
+   "reason": ""
+  },
+  {
+   "id": "quickshare",
+   "name": "Quick Share",
+   "state": "advertising",
+   "reason": ""
+  },
+  {
+   "id": "localsend",
+   "name": "LocalSend",
+   "state": "advertising",
+   "reason": ""
+  }
+ ],
+ "peers": [],
+ "incoming": [
+  {
+   "id": "i1",
+   "name": "Pixel 9",
+   "protocol": "quickshare",
+   "files": [
+    {
+     "name": "holiday-photo-0001.jpg",
+     "size": 4200000
+    },
+    {
+     "name": "holiday-photo-0002.jpg",
+     "size": 3900000
+    },
+    {
+     "name": "itinerary.pdf",
+     "size": 88000
+    },
+    {
+     "name": "a.txt",
+     "size": 10
+    },
+    {
+     "name": "b.txt",
+     "size": 10
+    },
+    {
+     "name": "c.txt",
+     "size": 10
+    }
+   ],
+   "totalSize": 8198030,
+   "pin": "4821"
+  },
+  {
+   "id": "i2",
+   "name": "Test Phone",
+   "protocol": "airdrop",
+   "files": [
+    {
+     "name": "IMG_4412.HEIC",
+     "size": 2100000
+    }
+   ],
+   "totalSize": 2100000,
+   "pin": null
+  }
+ ],
+ "transfers": [
+  {
+   "id": "r1",
+   "name": "clip.mov",
+   "fileName": "clip.mov",
+   "files": 1,
+   "peer": "Work Desktop",
+   "protocol": "localsend",
+   "direction": "in",
+   "bytes": 30000000,
+   "total": 120000000,
+   "state": "transferring",
+   "error": "",
+   "updated": 0
+  },
+  {
+   "id": "r2",
+   "name": "report.pdf",
+   "fileName": "report.pdf",
+   "files": 1,
+   "peer": "Studio Tablet",
+   "protocol": "localsend",
+   "direction": "in",
+   "bytes": 2000000,
+   "total": 2000000,
+   "state": "complete",
+   "error": "",
+   "updated": 0
+  }
+ ]
+}

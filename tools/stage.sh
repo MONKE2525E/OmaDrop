@@ -33,6 +33,7 @@ FROM_UPSTREAM=(
 
 OWL_BIN=$ROOT/upstream/owl/build/daemon/owl
 [ -x "$OWL_BIN" ] || { echo "no OWL build at $OWL_BIN; run tools/build-owl.sh first"; exit 1; }
+"$ROOT/tools/build-hostapd.sh"
 
 if [ ! -d "$UP/.git" ]; then
   git clone -q "$UPSTREAM_REPO" "$UP"
@@ -50,6 +51,7 @@ for f in "${FROM_UPSTREAM[@]}"; do
 done
 cp "$ROOT"/userspace/* "$LIB/"
 cp "$OWL_BIN" "$LIB/owl"
+cp "$ROOT/upstream/hostapd-2.11/hostapd/hostapd" "$LIB/hostapd-go"
 chmod 755 "$LIB/send-to-peer" "$LIB/omdrop-discoverable" "$LIB/owl" "$LIB"/*.py
 
 echo "staged $LIB: ${#FROM_UPSTREAM[@]} files from omdrop-awdl@${UPSTREAM_COMMIT:0:7}, $(ls "$ROOT/userspace" | wc -l) of ours, and owl"

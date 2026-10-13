@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+set -euo pipefail
+SELF=$(readlink -f -- "${BASH_SOURCE[0]}")
+HERE=$(cd -- "$(dirname -- "$SELF")" && pwd)
+PYTHON="${OMADROP_PYTHON:-${XDG_DATA_HOME:-$HOME/.local/share}/omadrop/venv/bin/python}"
+[[ -x "$PYTHON" ]] || PYTHON=python3
+exec "$PYTHON" "$HERE/omadrop.py" "$@"

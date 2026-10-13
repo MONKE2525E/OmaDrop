@@ -1,0 +1,87 @@
+{
+ "running": true,
+ "mode": "menu",
+ "remainingSeconds": null,
+ "name": "omarchy-desktop",
+ "directory": "/home/monke/Downloads",
+ "error": "",
+ "protocols": [
+  {
+   "id": "airdrop",
+   "name": "AirDrop",
+   "state": "advertising",
+   "reason": ""
+  },
+  {
+   "id": "quickshare",
+   "name": "Quick Share",
+   "state": "advertising",
+   "reason": ""
+  },
+  {
+   "id": "localsend",
+   "name": "LocalSend",
+   "state": "advertising",
+   "reason": ""
+  }
+ ],
+ "peers": [],
+ "incoming": [
+  {
+   "id": "e1",
+   "name": "Pixel 9",
+   "protocol": "quickshare",
+   "files": [
+    {
+     "name": "lapsed-photo.jpg",
+     "size": 4200000
+    }
+   ],
+   "totalSize": 4200000,
+   "pin": null,
+   "expiresIn": -20
+  },
+  {
+   "id": "e2",
+   "name": "Test Phone",
+   "protocol": "airdrop",
+   "files": [
+    {
+     "name": "zero-deadline.pdf",
+     "size": 88000
+    }
+   ],
+   "totalSize": 88000,
+   "pin": null,
+   "expiresAt": 0
+  },
+  {
+   "id": "e3",
+   "name": "Studio Tablet",
+   "protocol": "localsend",
+   "files": [
+    {
+     "name": "live-request.txt",
+     "size": 10
+    }
+   ],
+   "totalSize": 10,
+   "pin": "1190",
+   "expiresIn": 120
+  },
+  {
+   "id": "e4",
+   "name": "Desk Laptop",
+   "protocol": "localsend",
+   "files": [
+    {
+     "name": "no-deadline.txt",
+     "size": 12
+    }
+   ],
+   "totalSize": 12,
+   "pin": null
+  }
+ ],
+ "transfers": []
+}

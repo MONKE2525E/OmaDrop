@@ -1,0 +1,71 @@
+--- a/bin/omdrop
++++ b/bin/omdrop
+@@ -2112,10 +2112,11 @@
+ # stores links inert; nothing here opens one on its own. act_open exists only
+ # behind a click the user made on the notification.
+ 
+-# Put the arrival on the clipboard as well as announcing it: a link as its URL,
+-# an image as the image itself, anything else as its path. wl-copy forks a
+-# server to own the selection, so it has to survive us -- launch() gives it its
+-# own unit, the same reason the viewer needed one.
++# Put a file on the clipboard, only when the user asks (`omdrop act copy FILE`):
++# a link as its URL, an image as the image itself, anything else as its path.
++# Arrivals never do this on their own, since it would replace whatever the user
++# had copied. wl-copy forks a server to own the selection, so it has to survive
++# us -- launch() gives it its own unit, the same reason the viewer needed one.
+ copy_to_clipboard() {
+   local f=$1 url; url=$(link_target "$f")
+   command -v wl-copy >/dev/null 2>&1 || return 0
+@@ -2134,11 +2135,10 @@
+ 
+ act_notify() {
+   local f=$1 args=()
+-  copy_to_clipboard "$f"
+   # Only images get a thumbnail, the way a screenshot notification does.
+   case "${f,,}" in *.png|*.jpg|*.jpeg|*.gif|*.webp|*.heic|*.avif) args+=(--image "$f") ;; esac
+-  # Same shape as omarchy-capture-screenshot: clipboard plus file, a thumbnail,
+-  # and the whole toast clickable. The notification service honours exactly one
++  # Same shape as omarchy-capture-screenshot: a thumbnail, and the whole toast
++  # clickable. The notification service honours exactly one
+   # action -- the default, fired by clicking the body -- and --exec is how
+   # Omarchy's own toasts use it.
+   #
+@@ -2150,29 +2150,30 @@
+   # the name of what landed appears, and the only thing to click to open it,
+   # so it gets 8 s -- what a normal-urgency toast would get -- without
+   # claiming the urgency of one.
+-  local what="Saved to $(tildify "$(dirname "$f")")/"
+-  command -v wl-copy >/dev/null 2>&1 && what="Copied to clipboard, saved to $(tildify "$(dirname "$f")")/"
+-  omarchy-notification-send -t 8000 "$(basename "$f")" "$what (or click this)" \
++  omarchy-notification-send -t 8000 "$(basename "$f")" \
++    "Saved to $(tildify "$(dirname "$f")")/ (click to open)" \
+     "${args[@]}" --exec "$SELF" act open "$f" >/dev/null \
+     || echo "omdrop: notification failed for $f" >&2
+ }
+ 
+ # What to do with a file once the user has asked for it: `act open` is what the
+-# notification fires when clicked, and shell/browse are here for the terminal.
++# notification fires when clicked, and copy/shell/browse are here for the terminal.
+ # Each goes through launch(), which keeps the app out of our cgroup.
+ cmd_act() {
+-  local what=${1:?usage: omdrop act open|shell|browse FILE} f=${2:?}
++  local what=${1:?usage: omdrop act open|copy|shell|browse FILE} f=${2:?}
+   local dir; dir=$(dirname "$f")
+   case "$what" in
+     open)   act_open "$f" ;;
++    copy)   copy_to_clipboard "$f" ;;
+     shell)  ( cd "$dir" && launch "$(omarchy-default-terminal)" ) ;;
+     browse) launch xdg-open "$dir" ;;
+-    *) die "act $what: one of open, shell, browse" ;;
++    *) die "act $what: one of open, copy, shell, browse" ;;
+   esac
+ }
+ 
+-# One behaviour for every arrival: save, copy, announce. Opening is left to a
+-# click on the notification, so nothing runs on the user's behalf unasked.
++# One behaviour for every arrival: save and announce. Opening is left to a
++# click on the notification, and copying to `act copy`, so nothing runs on the
++# user's behalf unasked and the clipboard is never replaced.
+ cmd_handle() {
+   local f=${1:?usage: omdrop handle FILE}
+   act_notify "$f"

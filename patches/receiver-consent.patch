@@ -1,0 +1,67 @@
+--- a/bin/airdrop-serve.py
++++ b/bin/airdrop-serve.py
+@@ -40,6 +40,7 @@
+ import contacts  # noqa: E402  -- sibling module, found via the line above
+ import debugdump  # noqa: E402
+ import identity  # noqa: E402
++import airdrop_consent  # noqa: E402
+ 
+ # The identity's key is loaded into this process for the life of the window;
+ # keep it out of core dumps and away from same-UID ptrace.
+@@ -556,7 +557,7 @@
+         return written
+ 
+ 
+-def store_upload(raw, dest, tid, receive_budget):
++def store_upload(raw, dest, tid, receive_budget, consent):
+     """Decode and extract regular files, removing every output on failure."""
+     created = []
+     written = []
+@@ -588,6 +589,7 @@
+                         raise UploadLimitError(
+                             f'archive declares more than {budget.byte_limit} output bytes')
+                     base = safe_name(entry.pathname, 'file')
++                    airdrop_consent.check_file(consent, base, declared)
+                     name, output = open_new(dest, base)
+                     created.append(name)
+                     with output:
+@@ -595,6 +597,8 @@
+                         for block in entry.get_blocks():
+                             sink.write(block)
+                     written.append(name)
++            if consent['expected']:
++                raise ValueError('Archive omitted approved files')
+     except Exception:
+         for name in reversed(created):
+             try:
+@@ -824,6 +828,10 @@
+             # so an Upload that never passed an Ask has nothing vouching for it.
+             self._contacts_ok = True
+ 
++        if not airdrop_consent.approve(self, ask):
++            self.reject(403, 'Transfer was not approved')
++            return
++
+         # A `links` transfer is Ask-only: with SUPPORTS_URL (0x01) advertised,
+         # iOS puts the URL straight into Items and sends no /Upload at all, so
+         # accepting the Ask IS the transfer. Store it, or the link is lost.
+@@ -846,6 +854,10 @@
+         self.answer(resp)
+ 
+     def handle_upload(self):
++        consent = airdrop_consent.consume(self)
++        if consent is None:
++            self.reject(403, 'Upload requires an approved Ask')
++            return
+         # An Upload that never passed an Ask has nothing vouching for it, and
+         # the Upload itself carries no validation record to judge.
+         if contacts.visibility() == 'contacts' and not getattr(self, '_contacts_ok', False):
+@@ -878,7 +890,7 @@
+                 raw.seek(0)
+                 logging.info('upload %s: %d bytes dvzip (TotalBytes %s)',
+                              tid, wire_bytes, self.headers.get('TotalBytes'))
+-                written = store_upload(raw, DEST, tid, receive_budget)
++                written = store_upload(raw, DEST, tid, receive_budget, consent)
+             logging.info('upload %s: stored %s', tid, ', '.join(written))
+         except socket.timeout as e:
+             # Chunked framing announces no length, so there is none to name.

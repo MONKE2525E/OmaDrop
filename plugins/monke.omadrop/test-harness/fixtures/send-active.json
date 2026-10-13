@@ -1,0 +1,127 @@
+{
+ "running": true,
+ "mode": "menu",
+ "remainingSeconds": null,
+ "name": "omarchy-desktop",
+ "directory": "/home/monke/Downloads",
+ "error": "",
+ "protocols": [
+  {
+   "id": "airdrop",
+   "name": "AirDrop",
+   "state": "advertising",
+   "reason": ""
+  },
+  {
+   "id": "quickshare",
+   "name": "Quick Share",
+   "state": "advertising",
+   "reason": ""
+  },
+  {
+   "id": "localsend",
+   "name": "LocalSend",
+   "state": "advertising",
+   "reason": ""
+  }
+ ],
+ "peers": [
+  {
+   "id": "airdrop:aa",
+   "name": "Test Phone",
+   "protocol": "airdrop",
+   "deviceType": "mobile"
+  },
+  {
+   "id": "quickshare:p1",
+   "name": "Pixel 9",
+   "protocol": "quickshare",
+   "deviceType": "phone"
+  },
+  {
+   "id": "localsend:p2",
+   "name": "Studio Tablet",
+   "protocol": "localsend",
+   "deviceType": "tablet"
+  },
+  {
+   "id": "localsend:p3",
+   "name": "Work Desktop",
+   "protocol": "localsend",
+   "deviceType": "desktop"
+  }
+ ],
+ "incoming": [],
+ "transfers": [
+  {
+   "id": "t1",
+   "name": "holiday-video.mp4",
+   "fileName": "holiday-video.mp4",
+   "files": 1,
+   "peer": "Pixel 9",
+   "protocol": "quickshare",
+   "direction": "out",
+   "bytes": 61000000,
+   "total": 88000000,
+   "state": "transferring",
+   "error": "",
+   "updated": 0
+  },
+  {
+   "id": "t2",
+   "name": "notes.txt",
+   "fileName": "notes.txt",
+   "files": 1,
+   "peer": "Studio Tablet",
+   "protocol": "localsend",
+   "direction": "out",
+   "bytes": 0,
+   "total": 4000,
+   "state": "waiting",
+   "error": "",
+   "updated": 0
+  },
+  {
+   "id": "t3",
+   "name": "report.pdf",
+   "fileName": "report.pdf",
+   "files": 1,
+   "peer": "Work Desktop",
+   "protocol": "localsend",
+   "direction": "out",
+   "bytes": 2000000,
+   "total": 2000000,
+   "state": "complete",
+   "error": "",
+   "updated": 0
+  },
+  {
+   "id": "t4",
+   "name": "backup.tar",
+   "fileName": "backup.tar",
+   "files": 1,
+   "peer": "Studio Tablet",
+   "protocol": "localsend",
+   "direction": "out",
+   "bytes": 1000,
+   "total": 900000000,
+   "state": "failed",
+   "error": "Connection reset by peer",
+   "updated": 0
+  },
+  {
+   "id": "t5",
+   "name": "draft.docx",
+   "fileName": "draft.docx",
+   "files": 1,
+   "peer": "Test Phone",
+   "protocol": "airdrop",
+   "direction": "out",
+   "bytes": 0,
+   "total": 50000,
+   "state": "rejected",
+   "error": "Declined on the other device",
+   "updated": 0
+  }
+ ]
+}

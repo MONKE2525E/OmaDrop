@@ -1,0 +1,27 @@
+--- a/src/drivers/driver_nl80211.c
++++ b/src/drivers/driver_nl80211.c
+@@ -3012,8 +3012,22 @@
+ 	if (first && nl80211_get_ifmode(bss) == NL80211_IFTYPE_STATION)
+ 		drv->start_mode_sta = 1;
+ 
+-	if (drv->hostapd || bss->static_ap)
+-		nlmode = NL80211_IFTYPE_AP;
++	if (drv->hostapd || bss->static_ap) {
++		/* AWDL MCC experiment: mt7921 advertises #channels<=2 only in the
++		 * P2P-GO interface combination; plain AP is #channels<=1. Setting
++		 * HOSTAPD_P2P_GO=1 keeps the iftype as P2P-GO so START_AP is checked
++		 * against the multi-channel combination. is_ap_interface() already
++		 * treats P2P_GO as an AP interface, so no other path changes. */
++		const char *p2p_go = getenv("HOSTAPD_P2P_GO");
++
++		if (p2p_go && *p2p_go == '1') {
++			nlmode = NL80211_IFTYPE_P2P_GO;
++			wpa_printf(MSG_INFO,
++				   "nl80211: HOSTAPD_P2P_GO=1, using P2P-GO iftype");
++		} else {
++			nlmode = NL80211_IFTYPE_AP;
++		}
++	}
+ 	else if (bss->if_dynamic ||
+ 		 nl80211_get_ifmode(bss) == NL80211_IFTYPE_MESH_POINT)
+ 		nlmode = nl80211_get_ifmode(bss);

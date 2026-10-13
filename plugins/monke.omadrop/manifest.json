@@ -1,0 +1,31 @@
+{
+  "schemaVersion": 1,
+  "id": "monke.omadrop",
+  "name": "OmaDrop",
+  "version": "1.0.0",
+  "author": "monke",
+  "license": "MIT",
+  "description": "Send files to one nearby device and receive with explicit approval, over AirDrop, Quick Share and LocalSend, from one native Omarchy bar panel.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "activation": "on-demand",
+  "entryPoints": {
+    "barWidget": "ui/OmaDropPanel.qml"
+  },
+  "barWidget": {
+    "displayName": "OmaDrop",
+    "description": "One bar icon and one panel with two tabs: Send stages files and sends them to a single nearby device, Receive controls visibility and approves incoming files.",
+    "category": "Network",
+    "aliases": [
+      "omadrop",
+      "airdrop",
+      "quickshare",
+      "localsend",
+      "file-share"
+    ],
+    "allowMultiple": false,
+    "defaults": {},
+    "schema": []
+  }
+}

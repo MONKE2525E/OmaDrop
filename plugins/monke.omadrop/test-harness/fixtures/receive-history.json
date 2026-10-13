@@ -1,0 +1,60 @@
+{
+ "running": true,
+ "mode": "menu",
+ "remainingSeconds": null,
+ "name": "omarchy-desktop",
+ "directory": "/home/monke/Downloads",
+ "error": "",
+ "protocols": [
+  {
+   "id": "airdrop",
+   "name": "AirDrop",
+   "state": "advertising",
+   "reason": ""
+  },
+  {
+   "id": "quickshare",
+   "name": "Quick Share",
+   "state": "advertising",
+   "reason": ""
+  },
+  {
+   "id": "localsend",
+   "name": "LocalSend",
+   "state": "advertising",
+   "reason": ""
+  }
+ ],
+ "peers": [],
+ "incoming": [],
+ "transfers": [
+  {
+   "id": "h1",
+   "name": "boarding-pass.pdf",
+   "fileName": "boarding-pass.pdf",
+   "files": 1,
+   "peer": "Pixel 9",
+   "protocol": "quickshare",
+   "direction": "in",
+   "bytes": 300000,
+   "total": 300000,
+   "state": "complete",
+   "error": "",
+   "updated": 0
+  },
+  {
+   "id": "h2",
+   "name": "video-clip.mp4",
+   "fileName": "video-clip.mp4",
+   "files": 1,
+   "peer": "Studio Tablet",
+   "protocol": "localsend",
+   "direction": "in",
+   "bytes": 4000,
+   "total": 90000000,
+   "state": "failed",
+   "error": "Upload stalled",
+   "updated": 0
+  }
+ ]
+}

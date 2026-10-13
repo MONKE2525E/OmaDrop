@@ -1,0 +1,68 @@
+{
+ "running": true,
+ "mode": "menu",
+ "remainingSeconds": null,
+ "name": "omarchy-desktop",
+ "directory": "/home/monke/Downloads",
+ "error": "",
+ "protocols": [
+  {
+   "id": "airdrop",
+   "name": "AirDrop",
+   "state": "advertising",
+   "reason": ""
+  },
+  {
+   "id": "quickshare",
+   "name": "Quick Share",
+   "state": "advertising",
+   "reason": ""
+  },
+  {
+   "id": "localsend",
+   "name": "LocalSend",
+   "state": "advertising",
+   "reason": ""
+  }
+ ],
+ "peers": [
+  {
+   "id": "airdrop:aa",
+   "name": "Test Phone",
+   "protocol": "airdrop",
+   "deviceType": "mobile"
+  },
+  {
+   "id": "quickshare:p1",
+   "name": "Pixel 9",
+   "protocol": "quickshare",
+   "deviceType": "phone"
+  },
+  {
+   "id": "localsend:p2",
+   "name": "Studio Tablet",
+   "protocol": "localsend",
+   "deviceType": "tablet"
+  },
+  {
+   "id": "localsend:p3",
+   "name": "Work Desktop",
+   "protocol": "localsend",
+   "deviceType": "desktop"
+  },
+  {
+   "id": "localsend:rj",
+   "name": "Reject Phone",
+   "protocol": "localsend",
+   "deviceType": "phone"
+  },
+  {
+   "id": "quickshare:fl",
+   "name": "Fail Tablet",
+   "protocol": "quickshare",
+   "deviceType": "tablet"
+  }
+ ],
+ "incoming": [],
+ "transfers": []
+}
