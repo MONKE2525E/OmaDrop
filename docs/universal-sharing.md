@@ -38,8 +38,8 @@ It does not replace the existing `omdrop` CLI or change Wi-Fi drivers.
 | Quick Share | Pinned RQuickShare library through a native JSON-lines bridge | Same LAN with mDNS and TCP 53318 permitted; Bluetooth wake when BlueZ permits it; files and shared text/URLs |
 | AirDrop | Pinned `omdrop` receiver and OWL AWDL radio backend | `tools/install-airdrop.sh`; shared radio mode is verified on MT7925 |
 
-When UFW is active, the installer permits LocalSend TCP/UDP 53317 and Quick
-Share TCP 53318 from RFC1918 LAN ranges only.
+The installers do not change firewall rules. Review the LAN/interface-scoped
+LocalSend, Quick Share, and AWDL examples in the root README before adding rules.
 
 LocalSend uses a persistent self-signed certificate. Outbound HTTPS checks the
 certificate against the fingerprint announced by the peer. That is a
@@ -113,8 +113,10 @@ returns local file URLs, or stages image/text bytes in private runtime files.
 Clipboard copies are removed after sending or after one hour; original files
 are kept. Send targets one selected peer and returns its queued transfer ID
 immediately. Transfers report file count, first filename and update time.
-Finished transfers remain for ten minutes and at least the latest twenty;
-`dismiss ID` or `dismiss all` clears only finished transfers.
+Finished, failed, cancelled, and rejected transfers expire three hours after
+their terminal state. History is saved privately in `~/.config/omadrop/transfers.json`
+and expired rows are removed on restart as well as during use. `dismiss ID` or
+`dismiss all` clears only finished transfers and updates that saved history.
 Transfers with no state or byte progress for five minutes fail and release
 their operation lease once the UI observes that result. Menu visibility can
 continue while the menu remains open.
@@ -152,7 +154,7 @@ omadrop dismiss all
 ```
 
 Every command returns JSON. The coordinator listens on a user-only Unix socket
-under `$XDG_RUNTIME_DIR/omadrop`. Settings and TLS files live under
+under `$XDG_RUNTIME_DIR/omadrop`. Settings, transfer history, and TLS files live under
 `$XDG_CONFIG_HOME/omadrop`. The daemon log is in the runtime directory.
 Runtime device names and tokens are not written into repository files.
 

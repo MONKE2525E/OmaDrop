@@ -1,0 +1,10 @@
+[Trigger]
+Operation = Remove
+Type = Package
+Target = omdrop-owl
+
+[Action]
+Description = Restoring the OmaDrop Wi-Fi interface before removal...
+When = PreTransaction
+Exec = /usr/lib/omdrop/omdrop-discoverable stop
+AbortOnFail

@@ -1,0 +1,76 @@
+# Check both the radio package and sharing regressions on this fork.
+name: Check
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  aur-package:
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    steps:
+      - name: Install tools
+        run: pacman -Syu --noconfirm --needed git
+
+      - uses: actions/checkout@v4
+
+      # makepkg won't run as root.
+      - name: Build the AUR package
+        run: |
+          useradd -m builder
+          echo 'builder ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/builder
+          chown -R builder "$GITHUB_WORKSPACE"
+          sudo -u builder tools/test-aur-pkgbuild.sh -s --noconfirm
+
+  sharing-tests:
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    steps:
+      - name: Install tools
+        run: >-
+          pacman -Syu --noconfirm --needed git cmake libev libpcap libnl
+          rust protobuf uv openssl python-libarchive-c python-pillow
+          python-zeroconf python-ifaddr python-dbus python-gobject shellcheck
+
+      - uses: actions/checkout@v4
+
+      - name: Build protocol helpers
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          tools/build-owl.sh
+          tools/build-quickshare.sh
+
+      - name: Prepare the pinned receiver without system installation
+        run: |
+          . ./pins
+          git clone --quiet "$OMDROP_RECEIVER_REPO" build/test-receiver
+          git -C build/test-receiver checkout --quiet --detach "$OMDROP_RECEIVER_COMMIT"
+          for patch in receiver-consent receiver-progress receiver-clipboard receiver-links; do
+            patch -d build/test-receiver -p1 < "patches/$patch.patch"
+          done
+          cp scripts/airdrop_consent.py build/test-receiver/bin/
+          uv venv --system-site-packages build/test-venv
+          uv pip install --require-hashes --python build/test-venv/bin/python -r scripts/requirements.lock
+
+      - name: Run sharing and radio regressions
+        run: |
+          export OMADROP_QUICKSHARE_BIN="$PWD/build/omadrop-quickshare"
+          export OMADROP_AIRDROP_RECEIVER_DIR="$PWD/build/test-receiver/bin"
+          build/test-venv/bin/python - <<'PY'
+          import unittest
+          suite = unittest.defaultTestLoader.discover('tests')
+          result = unittest.TextTestRunner(verbosity=2).run(suite)
+          raise SystemExit(not result.wasSuccessful() or bool(result.skipped))
+          PY
+
+      - name: Check shell and Rust sources
+        run: |
+          shellcheck --shell=bash --severity=error --external-sources tools/*.sh scripts/omadrop userspace/omdrop-discoverable PKGBUILD
+          cargo fmt --manifest-path quickshare/Cargo.toml --check
+          cargo clippy --locked --release --manifest-path quickshare/Cargo.toml -- -D warnings
+          cargo test --locked --release --manifest-path quickshare/Cargo.toml

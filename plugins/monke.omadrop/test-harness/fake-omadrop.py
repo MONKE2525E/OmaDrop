@@ -18,6 +18,11 @@ Behaviour:
                    OMADROP_FAKE_PICK_DELAY seconds first
   stage-clipboard  prints OMADROP_FAKE_CLIP (json) or an empty-clipboard error
   stage-text       stages stdin as a text file
+
+Switches: OMADROP_FAKE_LEASE_HANG (the first lease never answers),
+OMADROP_FAKE_LEASE_FAIL (every lease fails), OMADROP_FAKE_DISMISS_FAIL (dismiss
+is refused), OMADROP_FAKE_DISMISS_DELAY (seconds before a dismiss answers).
+A lease that answers clears `starting` on the protocols.
 """
 import json
 import os
@@ -75,9 +80,18 @@ def main():
     if not args:
         return 2
     command = args[0]
+    if command == "dismiss":
+        # Lets a run see the row while its Clear is still in flight.
+        time.sleep(float(os.environ.get("OMADROP_FAKE_DISMISS_DELAY", "0")))
     state = advance(load())
     if command == "status":
         print(json.dumps(public(state)))
+    elif command == "lease" and os.environ.get("OMADROP_FAKE_LEASE_HANG") and not (root / "hung").exists():
+        # The first lease never answers: the service is stuck starting its
+        # radios. Later leases answer, so a Retry can succeed.
+        (root / "hung").write_text("1")
+        time.sleep(float(os.environ["OMADROP_FAKE_LEASE_HANG"]))
+        return 1
     elif command == "lease" and os.environ.get("OMADROP_FAKE_LEASE_FAIL"):
         print(json.dumps({"error": os.environ["OMADROP_FAKE_LEASE_FAIL"]}))
         return 1
@@ -85,6 +99,11 @@ def main():
         if state.get("mode") != "window":
             state["mode"] = "menu"
         state["running"] = True
+        # Once a lease answers the radios are up: starting protocols advertise.
+        state["starting"] = False
+        for p in state.get("protocols", []):
+            if p.get("state") == "starting":
+                p.update(state="advertising", reason="")
         save(state)
         print(json.dumps(public(state)))
     elif command == "release":
@@ -131,6 +150,10 @@ def main():
             state["incoming"] = [i for i in state.get("incoming", []) if i["id"] != ident]
         save(state)
         print(json.dumps({"ok": True}))
+    elif command == "dismiss" and os.environ.get("OMADROP_FAKE_DISMISS_FAIL"):
+        # The backend keeps the finished transfer and refuses to forget it.
+        print(json.dumps({"error": os.environ["OMADROP_FAKE_DISMISS_FAIL"]}))
+        return 1
     elif command == "dismiss":
         state["transfers"] = [t for t in state.get("transfers", [])
                               if t["id"] != args[1] or t["state"] in ("waiting", "transferring", "preparing")]

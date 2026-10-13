@@ -1,0 +1,32 @@
+{
+ "running": true,
+ "starting": true,
+ "mode": "off",
+ "remainingSeconds": null,
+ "name": "omarchy-desktop",
+ "directory": "/home/monke/Downloads",
+ "error": "",
+ "protocols": [
+  {
+   "id": "airdrop",
+   "name": "AirDrop",
+   "state": "starting",
+   "reason": "Starting nearby sharing."
+  },
+  {
+   "id": "quickshare",
+   "name": "Quick Share",
+   "state": "starting",
+   "reason": "Starting nearby sharing."
+  },
+  {
+   "id": "localsend",
+   "name": "LocalSend",
+   "state": "starting",
+   "reason": "Starting nearby sharing."
+  }
+ ],
+ "peers": [],
+ "incoming": [],
+ "transfers": []
+}

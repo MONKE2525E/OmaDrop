@@ -13,6 +13,7 @@
 # The same contract as omdrop-awdl's helper, which the omdrop CLI and
 # send-to-peer call against. Exit codes:
 #   0  visible (start), stopped (stop), always (status, peers)
+#   1  stop could not restore the original radio state; state remains for retry
 #   2  usage error, or not root
 #   3  can't become discoverable now (Wi-Fi not connected, or its AP isn't on
 #      an AWDL channel); retryable
@@ -25,6 +26,10 @@
 # station vif ACKs the phone's unicast. OWL creates awdl0, which omdrop's
 # receiver binds to; omdrop-awdl's awdl-airdrop-adv.py announces _airdrop._tcp
 # on it (--plain: OWL adds the AWDL encapsulation itself).
+#
+# A card whose profile says "exclusive" can't do that (Intel). Its station
+# comes down for the window, and an ad-hoc vif on AWDL's own BSSID sits beside
+# the monitor vif on a channel the card may transmit on: see exclusive_up.
 #
 # ROOT: required. Callers come through pkexec, which drops the environment, so
 # everything lives at fixed paths: helpers beside this script (/usr/lib/omdrop
@@ -43,12 +48,21 @@ IF=awdl0
 MON=mon0
 GO=omgo0
 GO_BIN=$LIB/hostapd-go
+IBSS=awdlibss0
+AWDL_BSSID=00:25:00:ff:94:73
 OWL_BIN=$LIB/owl
 PROFILES=$LIB/owl-profiles
 # Receiver capability flags in the announcement, as omdrop-awdl sends them:
 # 0x88 (OpenDrop's: SUPPORTS_MIXED_TYPES | SUPPORTS_DISCOVER_MAYBE) + SUPPORTS_URL.
 ADV_FLAGS=137
 ADV_INTERVAL=3
+# One round of announcements. Three copies do in shared mode, where OWL sends
+# them in AWDL's multicast slots and the phone is on our channel for those. In
+# exclusive mode it visits our channel for a slot or two in sixteen, and OWL
+# sends multicast as it comes (owl -F): a copy every 16 TU, one availability
+# window, for a whole period of sixteen slots.
+ADV_BURST="--count 3 --interval 0.05"
+ADV_BURST_EXCLUSIVE="--count 64 --interval 0.0164"
 VERSION=0.1.0
 # The omdrop-awdl helper contract this follows, which is also the version of
 # omdrop-awdl's tools staged beside it.
@@ -72,11 +86,13 @@ need_root() { [ "$(id -u)" = 0 ] || die "must run as root (through pkexec)" 2; }
 # The Wi-Fi station: $CONF/infra-iface, else the first managed interface.
 station_iface() {
   local forced d name
+  # A station turned into the cell (exclusive_up) isn't managed until stop.
+  [ -e "$RUN/converted" ] && { cat "$RUN/exclusive"; return; }
   forced=$(knob infra-iface)
   [ -n "$forced" ] && { echo "$forced"; return; }
   for d in /sys/class/net/*/phy80211; do
     name=$(basename "$(dirname "$d")")
-    [ "$name" = "$IF" ] || [ "$name" = "$MON" ] && continue
+    [ "$name" = "$IF" ] || [ "$name" = "$MON" ] || [ "$name" = "$GO" ] || [ "$name" = "$IBSS" ] && continue
     iw dev "$name" info 2>/dev/null | grep -q 'type managed' || continue
     echo "$name"
     return
@@ -105,6 +121,136 @@ untested_hint() {
 }
 
 mt76_dir() { echo "/sys/kernel/debug/ieee80211/$(basename "$(readlink -f "/sys/class/net/$1/phy80211")")/mt76"; }
+
+# ------------------------------------------------------------- exclusive mode
+
+# AWDL's channels this card may transmit on, 5 GHz first: an iPhone gives
+# channel 6 a slot or two in sixteen and 44 or 149 several. One marked "No IR",
+# radar or disabled is receive-only. That a channel is allowed doesn't mean an
+# ad-hoc cell can start there: the AX201 refuses every 5 GHz one (EINVAL on
+# 149 under a GB regdomain, where 44 is "No IR" until it has an AP there), so
+# exclusive_up tries them in this order.
+tx_channels() {  # PHY
+  local ok c
+  ok=$(iw phy "$1" channels 2>/dev/null | awk '
+    /^[[:space:]]*\* [0-9]+ MHz/ { if (f && ok) print f; f = $2; ok = !/disabled/; next }
+    /No IR|Radar detection/ { ok = 0 }
+    END { if (f && ok) print f }')
+  for c in 5220 5745 2437; do
+    grep -qx "$c" <<< "$ok" && echo "$c"
+  done
+}
+
+# Take the station off the air and put an ad-hoc vif in its place. AWDL's
+# frames are IBSS frames with a fixed BSSID, so joining that "IBSS" gives the
+# firmware an address to ACK for and a BSSID filter that passes AWDL, and
+# mac80211 a station entry per peer: unicast is sent, retried and ACKed the
+# ordinary way. Injected frames carry this vif's MAC, which is how mac80211
+# picks the vif to send them through. A monitor vif alone on the AX201 never
+# sees an ACK, and spends 100 ms retrying every unicast frame.
+# The cell has to be HT. An iPhone sends its unicast at HT rates (MCS 7 at
+# 65 Mbit/s here), which a NOHT cell neither receives nor ACKs; the phone then
+# takes us for unreachable and doesn't try again until it restarts.
+# The cell beacons as rarely as it may (every 10000 TU). Its beacons carry
+# AWDL's BSSID, which no AWDL device beacons with, and an iPhone restarted
+# beside a cell beaconing every 100 TU didn't list us where one beside a cell
+# beaconing every 10 s did (once each).
+# NetworkManager has to let go of the station first, or it brings it straight
+# back; $RUN/exclusive tells `stop` to give it back.
+# The AX211 refuses the ad-hoc vif while the station exists, even down
+# (EOPNOTSUPP), so there the station itself becomes the cell, and
+# $RUN/converted, which holds its IPv6 setting, tells `stop` to turn it back.
+# Prints the frequency the cell started on.
+exclusive_up() {  # STA PHY FREQ...
+  local sta=$1 phy=$2 f cell=$IBSS was_managed
+  shift 2
+  was_managed=$(nmcli -g GENERAL.NM-MANAGED device show "$sta" 2>/dev/null) || return 1
+  case "$was_managed" in yes|no) ;; *) return 1 ;; esac
+  printf '%s\n' "$was_managed" > "$RUN/managed" || return 1
+  echo "$sta" > "$RUN/exclusive"
+  # Only a converted station needs it, but it has to be read while connected.
+  nmcli -g GENERAL.CON-UUID device show "$sta" > "$RUN/connection" 2>/dev/null
+  nmcli device set "$sta" managed no >/dev/null 2>&1 || return 1
+  ip link set "$sta" down
+  if iw phy "$phy" interface add "$IBSS" type ibss 2>/dev/null; then
+    touch "$RUN/ibss-owned"
+    ip link set "$IBSS" address "$(cat "/sys/class/net/$sta/address")"
+  else
+    # Recorded before the change, so a start that fails partway still undoes it.
+    sysctl -n "net.ipv6.conf.$sta.disable_ipv6" > "$RUN/converted" 2>/dev/null
+    iw dev "$sta" set type ibss || return 1
+    cell=$sta
+  fi
+  # IP runs on awdl0. Left alone, the kernel and avahi take this vif for a
+  # network too and send plain IPv6 on AWDL's BSSID.
+  sysctl -qw "net.ipv6.conf.$cell.disable_ipv6=1" 2>/dev/null
+  ip link set "$cell" up || return 1
+  for f in "$@"; do
+    iw dev "$cell" ibss join omdrop "$f" HT20 fixed-freq "$AWDL_BSSID" beacon-interval 10000 >&2 || continue
+    # mac80211 scans the channel once before it starts the cell.
+    for _ in $(seq 200); do
+      iw dev "$cell" link 2>/dev/null | grep -q '^Joined IBSS' && { echo "$f"; return 0; }
+      sleep 0.05
+    done
+    iw dev "$cell" ibss leave 2>/dev/null
+  done
+  return 1
+}
+
+# NetworkManager reconnects by itself once it has the station back, except a
+# converted one: it can still find that unavailable for a moment, and then
+# leaves it, so that one is reconnected explicitly, up to three times.
+# Fails, keeping the state for the next stop or start, only if a converted
+# station can't be made a station again.
+exclusive_down() {
+  local sta converted=no ipv6 uuid was_managed
+  if [ -e "$RUN/ibss-owned" ]; then
+    if iw dev "$IBSS" info >/dev/null 2>&1; then
+      iw dev "$IBSS" ibss leave 2>/dev/null
+      iw dev "$IBSS" del 2>/dev/null
+    fi
+    if iw dev "$IBSS" info >/dev/null 2>&1; then
+      log "$IBSS still exists after stop; start will retry cleanup"
+      return 1
+    fi
+    rm -f "$RUN/ibss-owned"
+  fi
+  sta=$(cat "$RUN/exclusive" 2>/dev/null)
+  [ -n "$sta" ] || return 0
+  if [ -e "$RUN/converted" ]; then
+    converted=yes
+    ipv6=$(cat "$RUN/converted")
+    iw dev "$sta" ibss leave 2>/dev/null
+    ip link set "$sta" down 2>/dev/null
+    if [ ! -e "$RUN/type-restored" ]; then
+      iw dev "$sta" set type managed || return 1
+      touch "$RUN/type-restored" || return 1
+    fi
+    sysctl -qw "net.ipv6.conf.$sta.disable_ipv6=${ipv6:-0}" 2>/dev/null || return 1
+  fi
+  ip link set "$sta" up 2>/dev/null || return 1
+  was_managed=$(cat "$RUN/managed" 2>/dev/null)
+  case "$was_managed" in yes|no) ;; *) was_managed=yes ;; esac
+  nmcli device set "$sta" managed "$was_managed" >/dev/null 2>&1 || return 1
+  uuid=$(cat "$RUN/connection" 2>/dev/null)
+  # Not connected at start ("--" or empty): nothing to reconnect to.
+  # An originally unmanaged station belongs to its other network manager.
+  # Restoring its managed flag must not activate a saved NetworkManager UUID.
+  if [ "$converted" = yes ] && [ "$was_managed" = yes ] \
+    && [[ "$uuid" =~ ^[0-9a-fA-F-]{36}$ ]]; then
+    for _ in 1 2 3; do
+      if nmcli -w 10 connection up uuid "$uuid" ifname "$sta" >/dev/null 2>&1; then
+        rm -f "$RUN/exclusive" "$RUN/converted" "$RUN/connection" "$RUN/managed" "$RUN/type-restored"
+        return 0
+      fi
+      sleep 1
+    done
+    log "$sta is a station again, but didn't reconnect to $uuid"
+    return 1
+  fi
+  rm -f "$RUN/exclusive" "$RUN/converted" "$RUN/connection" "$RUN/managed" "$RUN/type-restored"
+  return 0
+}
 
 # --------------------------------------------------------------------- status
 
@@ -144,6 +290,7 @@ cmd_status() {
 # randomise their AWDL address, so nothing here remembers one.
 cmd_peers() {
   [ -r "$OWL_LOG" ] || die "no OWL log at $OWL_LOG; is the radio up?" 4
+  # No matches is normal while waiting for a phone, but keep real grep errors.
   { grep -oE '(add|remove) peer [0-9a-f:]+' "$OWL_LOG" || [ "$?" = 1 ]; } | awk '
     { n = split($3, o, ":"); mac = ""
       for (i = 1; i <= n; i++) mac = mac (i > 1 ? ":" : "") sprintf("%02s", o[i])
@@ -171,13 +318,13 @@ cmd_probe() {
     missing+=("hardware|$(untested_hint "$drv")")
   else
     [ -x "$OWL_BIN" ] || missing+=("backend|omdrop-owl is installed without OWL ($OWL_BIN). Reinstall omdrop-owl.")
-    case "$PROF_MODE" in shared|standalone|dualchan) ;; *) missing+=("backend|Unknown radio mode: $PROF_MODE.") ;; esac
+    case "$PROF_MODE" in shared|exclusive|standalone|dualchan) ;; *) missing+=("backend|Unknown radio mode: $PROF_MODE.") ;; esac
     ap=$(iw dev "$sta" link 2>/dev/null | awk '/freq:/ {print int($2)}')
     if [ "$PROF_MODE" = dualchan ]; then
       [ -x "$GO_BIN" ] || missing+=("backend|Wi-Fi Direct radio helper is missing; reinstall omdrop-owl.")
     elif [ "$PROF_MODE" = standalone ]; then
       [ -z "$ap" ] || missing+=("radio|Standalone AirDrop needs an idle Wi-Fi card; disconnect Wi-Fi first.")
-    else
+    elif [ "$PROF_MODE" = shared ]; then
     case "$ap" in
       2437|5220|5745) ;;
       "") missing+=("radio|Wi-Fi isn't connected, and AirDrop shares its channel. Connect to Wi-Fi first.") ;;
@@ -197,10 +344,20 @@ print(json.dumps({"backend": "owl", "version": os.environ["V"], "contract": os.e
 # ----------------------------------------------------------------------- stop
 
 cmd_stop() {
-  local why=${1:-stopped} sup sta pm reconnect
+  local why=${1:-stopped} sup sta pm reconnect reconnect_ok restore_status=0 reason restore_errors="" idle idle_managed idle_up idle_failed mt76
   need_root
-  exec 9> "$RUN/lock" 2>/dev/null || { mkdir -p "$RUN"; exec 9> "$RUN/lock"; }
+  mkdir -p "$RUN"
+  exec 9> "$RUN/lock"
   flock 9
+  # Windows started by an older helper did not record interface ownership.
+  # Migrate only while its recorded OWL process still proves this window uses
+  # mon0; stale state alone must never authorize deleting another interface.
+  if alive "$(pid_of owl)" "$OWL_BIN -i $MON "; then
+    touch "$RUN/mon-owned"
+    if [ "$(awk '{print $2}' "$RUN/profile" 2>/dev/null)" = exclusive ] && [ ! -e "$RUN/converted" ]; then
+      touch "$RUN/ibss-owned"
+    fi
+  fi
   sup=$(pid_of supervisor)
   # The supervisor calls `stop expired` itself; don't kill the caller.
   [ -n "$sup" ] && [ "$sup" != "$$" ] && [ "$sup" != "${PPID:-}" ] && kill "$sup" 2>/dev/null
@@ -211,25 +368,81 @@ cmd_stop() {
   done
   alive "$(pid_of owl)" "$OWL_BIN" && kill "$(pid_of owl)" 2>/dev/null
   pkill -f "^$OWL_BIN " 2>/dev/null
-  ip link set "$MON" down 2>/dev/null
-  iw dev "$MON" del 2>/dev/null
+  if [ -e "$RUN/mon-owned" ]; then
+    if iw dev "$MON" info >/dev/null 2>&1; then
+      ip link set "$MON" down 2>/dev/null
+      iw dev "$MON" del 2>/dev/null
+    fi
+    if iw dev "$MON" info >/dev/null 2>&1; then
+      restore_status=1
+      restore_errors="${restore_errors:+$restore_errors; }$MON could not be removed"
+      log "$MON still exists after stop; start will retry cleanup"
+    else
+      rm -f "$RUN/mon-owned"
+    fi
+  fi
   if [ -f "$RUN/go-owned" ]; then
     alive "$(pid_of go)" "$GO_BIN" && kill "$(pid_of go)" 2>/dev/null
-    iw dev "$GO" del 2>/dev/null
-    rm -f "$RUN/go-owned" "$RUN/go.pid" "$RUN/hostapd.conf"
+    if iw dev "$GO" info >/dev/null 2>&1; then
+      ip link set "$GO" down 2>/dev/null
+      iw dev "$GO" del 2>/dev/null
+    fi
+    if iw dev "$GO" info >/dev/null 2>&1; then
+      restore_status=1
+      restore_errors="${restore_errors:+$restore_errors; }$GO could not be removed"
+      log "$GO still exists after stop; start will retry cleanup"
+    else
+      rm -f "$RUN/go-owned" "$RUN/go.pid" "$RUN/hostapd.conf"
+    fi
   fi
   if [ -r "$RUN/idle-station" ]; then
-    local idle was_managed was_up
-    read -r idle was_managed was_up < "$RUN/idle-station"
-    [ "$was_up" = yes ] && ip link set "$idle" up
-    [ "$was_managed" = yes ] && nmcli device set "$idle" managed yes >/dev/null 2>&1
-    rm -f "$RUN/idle-station"
+    idle_managed=0
+    idle_up=0
+    idle_failed=0
+    read -r idle idle_managed idle_up < "$RUN/idle-station"
+    case "$idle_managed" in
+      yes|no) nmcli device set "$idle" managed "$idle_managed" >/dev/null 2>&1 || {
+        restore_status=1
+        idle_failed=1
+        restore_errors="${restore_errors:+$restore_errors; }$idle NetworkManager state could not be restored"
+      } ;;
+      *) restore_status=1
+         idle_failed=1
+         restore_errors="${restore_errors:+$restore_errors; }$idle has invalid saved NetworkManager state" ;;
+    esac
+    case "$idle_up" in
+      yes) ip link set "$idle" up || {
+             restore_status=1
+             idle_failed=1
+             restore_errors="${restore_errors:+$restore_errors; }$idle link state could not be restored"
+           } ;;
+      no) ip link set "$idle" down || {
+            restore_status=1
+            idle_failed=1
+            restore_errors="${restore_errors:+$restore_errors; }$idle link state could not be restored"
+          } ;;
+      *) restore_status=1
+         idle_failed=1
+         restore_errors="${restore_errors:+$restore_errors; }$idle has invalid saved link state" ;;
+    esac
+    [ "$idle_failed" -ne 0 ] || rm -f "$RUN/idle-station"
+  fi
+  if ! exclusive_down; then
+    restore_status=1
+    restore_errors="${restore_errors:+$restore_errors; }exclusive radio state could not be restored"
   fi
   sta=$(cat "$RUN/station" 2>/dev/null)
   pm=$(cat "$RUN/pm" 2>/dev/null)
   if [ -n "$sta" ] && [ -n "$pm" ]; then
-    echo "${pm%% *}" > "$(mt76_dir "$sta")/runtime-pm" 2>/dev/null
-    echo "${pm##* }" > "$(mt76_dir "$sta")/deep-sleep" 2>/dev/null
+    mt76=$(mt76_dir "$sta")
+    if ! echo "${pm%% *}" > "$mt76/runtime-pm" 2>/dev/null; then
+      restore_status=1
+      restore_errors="${restore_errors:+$restore_errors; }$sta runtime power setting could not be restored"
+    fi
+    if ! echo "${pm##* }" > "$mt76/deep-sleep" 2>/dev/null; then
+      restore_status=1
+      restore_errors="${restore_errors:+$restore_errors; }$sta deep-sleep setting could not be restored"
+    fi
   fi
   # Some drivers' stations stop receiving after a monitor vif is deleted (the
   # MT7925: README, "Known issues"), and omdrop's contract forbids reloading
@@ -244,19 +457,44 @@ cmd_stop() {
   esac
   if [ -n "$sta" ] && [ "$reconnect" = yes ] && [ "$(awk '{print $2}' "$RUN/profile" 2>/dev/null)" = shared ]; then
     sleep 1
-    nmcli -w 20 device connect "$sta" >/dev/null 2>&1 || iw dev "$sta" disconnect 2>/dev/null
+    reconnect_ok=no
+    if nmcli -w 20 device connect "$sta" >/dev/null 2>&1; then
+      reconnect_ok=yes
+    else
+      iw dev "$sta" disconnect 2>/dev/null
+      for _ in 1 2 3; do
+        if nmcli -w 20 device connect "$sta" >/dev/null 2>&1; then
+          reconnect_ok=yes
+          break
+        fi
+        sleep 1
+      done
+    fi
+    if [ "$reconnect_ok" != yes ]; then
+      restore_status=1
+      restore_errors="${restore_errors:+$restore_errors; }$sta did not reconnect after stop"
+    fi
   fi
   rm -f "$RUN/supervisor.pid" "$RUN/owl.pid" "$RUN/until"
-  printf '%s' "$why" > "$RUN/reason"
-  log "stopped ($why)"
-  return 0
+  if [ "$restore_status" -eq 0 ]; then
+    rm -f "$RUN/pm" "$RUN/station" "$RUN/profile"
+  fi
+  reason=$why
+  if [ "$restore_status" -ne 0 ]; then
+    reason="Radio state could not be restored: $restore_errors; run stop again to retry"
+    echo "omdrop-discoverable: $reason" >&2
+  fi
+  printf '%s' "$reason" > "$RUN/reason"
+  log "stopped ($reason)"
+  return "$restore_status"
 }
 
 # ---------------------------------------------------------------------- start
 
 # The background half of a window: announce, watch OWL, end at expiry.
 supervise() {
-  local until
+  local until burst=$ADV_BURST
+  [ -e "$RUN/exclusive" ] && burst=$ADV_BURST_EXCLUSIVE
   while true; do
     until=$(cat "$RUN/until" 2>/dev/null || echo 0)
     if [ "${until:-0}" -gt 0 ] && [ "$(date +%s)" -ge "$until" ]; then
@@ -279,14 +517,14 @@ supervise() {
       echo $! > "$RUN/ble.pid"
     fi
     python3 "$LIB/awdl-airdrop-adv.py" --iface "$IF" --plain --flags "$ADV_FLAGS" --port 8771 \
-      --count 3 --interval 0.05 >> "$RUN/announce.log" 2>&1
+      $burst >> "$RUN/announce.log" 2>&1
     sleep "$ADV_INTERVAL"
   done
 }
 
 cmd_start() {
-  local secs=${1:-} sta drv gw ap chan stamac monmac mt76 _ was_managed was_up
-  local owl_extra=()
+  local secs=${1:-} sta drv phy gw ap freqs chan stamac monmac mt76 _ was_managed was_up ll reason
+  local owl_extra=() strategy=intersect
   [[ "$secs" =~ ^[0-9]+$ ]] || die "usage: omdrop-discoverable start <seconds>" 2
   need_root
   mkdir -p "$RUN"
@@ -301,6 +539,14 @@ cmd_start() {
   fi
   : > "$RUN/log"
   : > "$RUN/announce.log"
+  # A station the last stop couldn't turn back still holds the cell, and
+  # exclusive_up would take its state for the original.
+  if [ -e "$RUN/converted" ] || [ -e "$RUN/exclusive" ] || [ -e "$RUN/mon-owned" ] || [ -e "$RUN/go-owned" ] || [ -e "$RUN/idle-station" ] || [ -e "$RUN/pm" ] || [ -e "$RUN/station" ]; then
+    if ! cmd_stop recovered >/dev/null 2>&1; then
+      reason=$(cat "$RUN/reason" 2>/dev/null)
+      die "${reason:-The last sharing window could not be cleaned up. Run omadrop stop to retry.}" 4
+    fi
+  fi
   rm -f "$RUN/reason"
 
   sta=$(station_iface)
@@ -310,7 +556,17 @@ cmd_start() {
   if [ "$PROF_STATUS" != tested ] && [ "$(knob allow-untested)" != 1 ]; then
     die "$(untested_hint "$drv")" 4
   fi
-  case "$PROF_MODE" in shared|standalone|dualchan) ;; *) die "unknown radio mode: $PROF_MODE" 4 ;; esac
+  case "$PROF_MODE" in shared|exclusive|standalone|dualchan) ;; *) die "unknown radio mode: $PROF_MODE" 4 ;; esac
+  phy=$(basename "$(readlink -f "/sys/class/net/$sta/phy80211")")
+  # Refuse foreign interfaces before taking the station off the air.
+  if iw dev "$MON" info >/dev/null 2>&1; then
+    die "$MON already exists; refusing to replace an interface not owned by this window" 4
+  fi
+  if [ "$PROF_MODE" = dualchan ]; then
+    iw dev "$GO" info >/dev/null 2>&1 && die "$GO already exists; refusing to replace it" 4
+  elif [ "$PROF_MODE" = exclusive ]; then
+    iw dev "$IBSS" info >/dev/null 2>&1 && die "$IBSS already exists; refusing to replace it" 4
+  fi
   if [ "$PROF_MODE" = dualchan ]; then
     [ -x "$GO_BIN" ] || die "Wi-Fi Direct radio helper is missing" 4
     chan=$(knob airdrop-channel)
@@ -324,33 +580,40 @@ cmd_start() {
     chan=${chan:-6}
     case "$chan" in 6|44|149) ;; *) die "standalone-channel must be 6, 44 or 149" 2 ;; esac
     gw=""
+  elif [ "$PROF_MODE" = exclusive ]; then
+    gw=none
+    freqs=$(tx_channels "$phy")
+    [ -n "$freqs" ] || die "this Wi-Fi card may not transmit on any of AirDrop's channels (6, 44, 149) here" 4
+    # From here a failure has to give Wi-Fi back, which is cmd_stop's job.
+    if ! ap=$(exclusive_up "$sta" "$phy" $freqs); then
+      cmd_stop start-failed >/dev/null
+      die "could not start the ad-hoc interface $IBSS on any of AirDrop's channels" 4
+    fi
   else
-  # Wi-Fi takes a few seconds after a driver reload to associate and get an
-  # address; don't judge a link that's still coming up.
-  for _ in $(seq 15); do
-    gw=$(ip -4 route show default dev "$sta" 2>/dev/null | awk '{print $3; exit}')
-    [ -n "$gw" ] && ping -c1 -W1 -I "$sta" "$gw" >/dev/null 2>&1 && break
-    gw=""
-    sleep 1
-  done
-  [ -n "$gw" ] || die "Wi-Fi isn't connected (or isn't passing traffic), and AirDrop shares its channel. Connect to Wi-Fi and try again." 3
-  ap=$(iw dev "$sta" link | awk '/freq:/ {print int($2)}')
-  case "$ap" in
-    2437) chan=6 ;; 5220) chan=44 ;; 5745) chan=149 ;;
-    *) die "your Wi-Fi network is on ${ap:-an unknown} MHz, but AirDrop can only share channel 6, 44 or 149 with it. Moving the router to one of those makes this work." 3 ;;
-  esac
+    # Wi-Fi takes a few seconds after a driver reload to associate and get an
+    # address; don't judge a link that's still coming up.
+    for _ in $(seq 15); do
+      gw=$(ip -4 route show default dev "$sta" 2>/dev/null | awk '{print $3; exit}')
+      [ -n "$gw" ] && ping -c1 -W1 -I "$sta" "$gw" >/dev/null 2>&1 && break
+      gw=""
+      sleep 1
+    done
+    [ -n "$gw" ] || die "Wi-Fi isn't connected (or isn't passing traffic), and AirDrop shares its channel. Connect to Wi-Fi and try again." 3
+    ap=$(iw dev "$sta" link | awk '/freq:/ {print int($2)}')
+  fi
+  if [ "$PROF_MODE" = shared ] || [ "$PROF_MODE" = exclusive ]; then
+    case "$ap" in
+      2437) chan=6 ;; 5220) chan=44 ;; 5745) chan=149 ;;
+      *) die "your Wi-Fi network is on ${ap:-an unknown} MHz, but AirDrop can only share channel 6, 44 or 149 with it. Moving the router to one of those makes this work." 3 ;;
+    esac
   fi
   stamac=$(cat "/sys/class/net/$sta/address")
   echo "$sta" > "$RUN/station"
   echo "$drv $PROF_MODE $PROF_MONMAC $PROF_RECONNECT $PROF_PM" > "$RUN/profile"
   log "station $sta ($stamac, $drv) on ch$chan, gateway $gw; profile: mode=$PROF_MODE mon_mac=$PROF_MONMAC reconnect=$PROF_RECONNECT mt76_pm=$PROF_PM"
 
-  if iw dev "$MON" info >/dev/null 2>&1; then
-    die "$MON already exists; refusing to replace an interface not owned by this window" 4
-  fi
   if [ "$PROF_MODE" = dualchan ]; then
-    iw dev "$GO" info >/dev/null 2>&1 && die "$GO already exists; refusing to replace it" 4
-    iw phy "$(basename "$(readlink -f "/sys/class/net/$sta/phy80211")")" interface add "$GO" type __p2pgo \
+    iw phy "$phy" interface add "$GO" type __p2pgo \
       || die "could not create the Wi-Fi Direct interface" 4
     touch "$RUN/go-owned"
     local gomac pass hw
@@ -390,8 +653,9 @@ EOF
     nmcli device set "$sta" managed no >/dev/null 2>&1
     ip link set "$sta" down
   fi
-  iw phy "$(basename "$(readlink -f "/sys/class/net/$sta/phy80211")")" interface add "$MON" type monitor \
+  iw phy "$phy" interface add "$MON" type monitor \
     || { cmd_stop monitor-failed >/dev/null; die "could not create the monitor interface $MON" 4; }
+  touch "$RUN/mon-owned"
   # mon_mac: the station's MAC on the monitor interface, or one of its own
   # (locally administered, derived from the station's) with OWL told the
   # station's through -m.
@@ -406,6 +670,15 @@ EOF
   if [ "$PROF_MODE" = standalone ]; then
     iw dev "$MON" set channel "$chan" || { cmd_stop channel-failed >/dev/null; die "could not tune $MON to channel $chan" 4; }
   fi
+  # owl -F, -E: patches/owl-03-fixed-radio.patch, owl-04-election-metric.patch.
+  # -S pin advertises our one channel in all sixteen slots, which with -F is
+  # where we are (patches/owl-06-fixed-radio-pin.patch), rather than only the
+  # slots the phone already gives it: those move while the phone makes room
+  # for us, and the intersection trails them by a tick.
+  if [ "$PROF_MODE" = exclusive ]; then
+    owl_extra+=(-F -E)
+    strategy=pin
+  fi
 
   # mt76_pm: runtime PM off for the window, restored by stop.
   mountpoint -q /sys/kernel/debug || mount -t debugfs none /sys/kernel/debug 2>/dev/null
@@ -419,23 +692,44 @@ EOF
   if [ "$secs" -gt 0 ]; then echo $(( $(date +%s) + secs )) > "$RUN/until"; else echo 0 > "$RUN/until"; fi
   # 9>&-: children must not inherit the lock, or the long-lived ones would hold
   # it for the whole window and the next `stop` would wait forever.
-  setsid "$OWL_BIN" -i "$MON" -c "$chan" -N -S intersect "${owl_extra[@]}" -v > "$OWL_LOG" 2>&1 < /dev/null 9>&- &
+  setsid "$OWL_BIN" -i "$MON" -c "$chan" -N -S "$strategy" "${owl_extra[@]}" -v > "$OWL_LOG" 2>&1 < /dev/null 9>&- &
   echo $! > "$RUN/owl.pid"
-  for _ in $(seq 20); do ip link show "$IF" >/dev/null 2>&1 && break; sleep 0.5; done
+  # 50 ms polls: OWL creates it in well under a second, and 0.5 s steps cost up to 0.5 s.
+  for _ in $(seq 200); do ip link show "$IF" >/dev/null 2>&1 && break; sleep 0.05; done
   if ! ip link show "$IF" >/dev/null 2>&1; then
     local why; why=$(tail -1 "$OWL_LOG" 2>/dev/null)
     cmd_stop owl-failed >/dev/null
     die "AWDL didn't come up: ${why:-OWL exited}" 4
   fi
   nmcli device set "$IF" managed no >/dev/null 2>&1
+  # No duplicate address detection on awdl0: its link-local comes from our own
+  # MAC on a link we alone create, and DAD held it "tentative" for about 1.2 s
+  # of every start (measured 2026-10-10). OWL brings awdl0 up itself, so the
+  # address exists before accept_dad=0 can apply; re-add it with nodad instead.
+  sysctl -qw "net.ipv6.conf.$IF.accept_dad=0" 2>/dev/null
   ip link set "$IF" up
+  for _ in $(seq 40); do
+    ll=$(ip -6 addr show dev "$IF" scope link tentative 2>/dev/null | awk '/inet6/ {print $2; exit}')
+    [ -n "$ll" ] && break
+    ip -6 addr show dev "$IF" scope link 2>/dev/null | grep -q inet6 && break
+    sleep 0.05
+  done
+  if [ -n "${ll:-}" ]; then
+    ip -6 addr del "$ll" dev "$IF" 2>/dev/null
+    ip -6 addr add "$ll" dev "$IF" scope link nodad 2>/dev/null
+  fi
   # awdl0's link-local stays "tentative" during duplicate address detection,
   # and omdrop's receiver refuses to start without a usable one.
-  for _ in $(seq 20); do
+  for _ in $(seq 200); do
     ip -6 addr show dev "$IF" scope link | grep -q inet6 \
       && ! ip -6 addr show dev "$IF" scope link | grep -q tentative && break
-    sleep 0.5
+    sleep 0.05
   done
+  if ! ip -6 addr show dev "$IF" scope link | grep -q inet6 \
+    || ip -6 addr show dev "$IF" scope link | grep -q tentative; then
+    cmd_stop address-failed >/dev/null
+    die "AWDL has no usable IPv6 link-local address; see $OWL_LOG" 4
+  fi
 
   setsid "$SELF" __supervise > /dev/null 2>&1 < /dev/null 9>&- &
   echo $! > "$RUN/supervisor.pid"

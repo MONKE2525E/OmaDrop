@@ -72,6 +72,23 @@ Panel {
   readonly property bool leaseWanted: opened || staging === "picking" || pickingDirectory
     || sendingPeer !== "" || liveTransfers > 0 || incomingCount > 0
 
+  // Startup is bounded. The backend starts its protocols at once, each with a
+  // 60 s deadline, so the watchdog waits past that before calling it stalled.
+  // The lease call ends by itself at leaseLimitSeconds with its own error.
+  // The harness shortens both to run the same logic in seconds.
+  property int startupSeconds: 65
+  property int leaseLimitSeconds: 70
+  // The backend's own report that it is still bringing its protocols up. The
+  // mode can already read "menu" while this is true, so it does not count as up.
+  readonly property bool backendStarting: !!status && status.starting === true
+  readonly property bool radiosUp: !!status && !backendStarting
+    && (status.mode === "window" || status.mode === "menu")
+  readonly property bool startupPending: leaseWanted && backendError === "" && !!status && !radiosUp
+  property bool startupStalled: false
+  readonly property bool startupFailed: startupPending && (startupStalled || leaseError !== "")
+  readonly property bool startupWaiting: startupPending && !startupFailed
+    && (backendStarting || leaseProc.running)
+
   // ---------------------------------------------------------------- status
   //
   // A request that arrives while a poll is running is queued, not dropped: an
@@ -88,7 +105,7 @@ Panel {
     var parsed = null
     try { parsed = JSON.parse(text) } catch (e) { parsed = null }
     if (parsed === null || typeof parsed !== "object") {
-      backendError = code === 127 || code === -1 ? "omadrop is not installed next to this plugin."
+      backendError = code === 127 || code === -1 ? "The OmaDrop command is missing, so nearby sharing cannot run."
         : (errText.trim() !== "" ? errText.trim().split("\n").pop()
            : "omadrop status gave no usable answer (exit " + code + ").")
       return
@@ -155,10 +172,19 @@ Panel {
     }
   }
 
+  // Same rule as the Receive tab: a missing `expiresAt` is no deadline, while an
+  // explicit 0, a past time or a non-number has lapsed. A lapsed request gets no
+  // new toast, because the toast leads to an Accept that is disabled.
+  function lapsed(request) {
+    if (request.expiresAt === undefined || request.expiresAt === null || request.expiresAt === "") return false
+    var at = Number(request.expiresAt)
+    return !isFinite(at) || at < 0 || at <= Date.now() / 1000
+  }
+
   function syncNotifications(requests) {
     var next = {}
     if (notificationsEnabled) requests.forEach(function(request) {
-      if (!request.id) return
+      if (!request.id || lapsed(request)) return
       if (Object.prototype.hasOwnProperty.call(notificationJobs, request.id)) {
         next[request.id] = notificationJobs[request.id]
         return
@@ -228,14 +254,17 @@ Panel {
     stdout: StdioCollector { id: leaseOut; waitForEnd: true }
     stderr: StdioCollector { id: leaseErr; waitForEnd: true }
     onExited: function(code) {
-      root.leaseError = code === 0 ? "" : root.failureText(code, leaseOut.text, leaseErr.text)
+      // 124 is `timeout` ending a lease call that never answered.
+      root.leaseError = code === 0 ? "" : code === 124
+        ? "The start command did not answer within " + root.leaseLimitSeconds + " seconds."
+        : root.failureText(code, leaseOut.text, leaseErr.text)
       root.refreshStatus()
     }
   }
 
   function renewLease() {
     if (leaseProc.running || !leaseWanted) return
-    leaseProc.command = [cli, "lease", "--seconds", "30", "--lease-id", leaseId]
+    leaseProc.command = ["timeout", String(leaseLimitSeconds), cli, "lease", "--seconds", "30", "--lease-id", leaseId]
     leaseProc.running = true
   }
 
@@ -276,7 +305,29 @@ Panel {
     onTriggered: if (!root.leaseWanted) { root.leaseError = ""; root.releaseLease() }
   }
 
-  onLeaseWantedChanged: if (leaseWanted) releaseTimer.stop(); else releaseTimer.restart()
+  onLeaseWantedChanged: {
+    if (leaseWanted) releaseTimer.stop()
+    else { releaseTimer.restart(); startupStalled = false }
+  }
+
+  // A stall is reported, not cancelled: the lease call ends at its own limit
+  // with a truthful error, and Retry is offered from there. The stall clears
+  // only when the need ends or the radios come up, never when it is reported.
+  Timer {
+    id: startupWatch
+    interval: root.startupSeconds * 1000
+    running: root.startupWaiting
+    onTriggered: root.startupStalled = true
+  }
+
+  onRadiosUpChanged: if (radiosUp) startupStalled = false
+
+  function retryStartup() {
+    startupStalled = false
+    leaseError = ""
+    renewLease()
+    refreshStatus()
+  }
 
   // --------------------------------------------------------------- actions
   //
@@ -362,7 +413,10 @@ Panel {
   function accept(id) { run(["accept", id], id) }
   function reject(id) { run(["reject", id], id) }
   function cancel(id) { run(["cancel", id], id) }
-  function dismiss(id) { run(["dismiss", id], "") }
+  function dismiss(id) {
+    // The row stays until the backend confirms it forgot the transfer.
+    run(["dismiss", id], id, function(code) { if (code === 0) view.markCleared(id) })
+  }
   function keepVisible() { run(["start", "--seconds", "600"], "window") }
   function stopVisible() {
     // `stop` ends the window and the menu lease with it; take the lease back
@@ -557,7 +611,10 @@ Panel {
       sendingPeer: root.sendingPeer
       stageHint: root.stageHint
       pickingDirectory: root.pickingDirectory
-      leasing: root.leaseWanted
+      startupWaiting: root.startupWaiting
+      startupFailed: root.startupFailed
+      startupSeconds: root.startupSeconds
+      leaseBusy: leaseProc.running
 
       onChooseFilesRequested: root.chooseFiles()
       onPasteRequested: root.pasteClipboard()
@@ -574,6 +631,7 @@ Panel {
       onStopVisibleRequested: root.stopVisible()
       onPickDirectoryRequested: root.pickDirectory()
       onRetryRequested: { root.actionError = ""; root.refreshStatus() }
+      onRetryStartupRequested: root.retryStartup()
       onCloseRequested: root.close()
     }
   }

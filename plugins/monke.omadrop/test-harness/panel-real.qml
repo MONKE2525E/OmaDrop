@@ -9,18 +9,27 @@ import "./ui"
 // Test only: the real ui/OmaDropPanel.qml (real KeyboardPanel popup) under a
 // stand-in bar, fed by test-harness/fake-omadrop.py.
 //
-//   OMADROP_SCREEN  output name for the bar and popup (default: first screen)
-//   OMADROP_MAXH    override the panel's height cap (px) to test short screens
-//   OMADROP_SHIFT   move the bar widget left by N px, which moves the popup's
-//                   x and so its sub-pixel placement on fractionally scaled outputs
-//   OMADROP_STEPS   semicolon-separated steps, run in order:
-//     tab:N  click:LABEL[#n]  stage:/a|/b  droptext:TEXT  paste  choose
-//     send:PEERID  wait:MS  shot:PATH  dump  audit  scroll:DY  close  open  drag:/path
-//   `audit` logs controls that leave the card or the screen or are cut by the
-//   scroll viewport.
-//   `click` finds the nth visible, enabled control whose text is LABEL and
-//   emits its clicked() signal, the same path a pointer press takes.
-//   `shot` crops the popup (plus a margin, so its border is visible) with grim.
+//   OMADROP_SCREEN            output name for the bar and popup (default: first screen)
+//   OMADROP_MAXH              override the panel's height cap (px) for short screens
+//   OMADROP_SHIFT             move the bar widget left by N px (sub-pixel placement)
+//   OMADROP_STARTUP_SECONDS   shorten the startup watchdog (default 65)
+//   OMADROP_LEASE_SECONDS     shorten the start command's limit (default 70)
+//   OMADROP_STEPS             semicolon-separated steps, run in order:
+//     tab:N  focusnext:N  focusreport  click:LABEL[#n]  stage:/a|/b
+//     droptext:TEXT  paste  choose  send:PEERID  wait:MS  shot:PATH
+//     dump  audit  buttons  focusall  scroll:DY  close  open  drag:/path
+//   `focusnext` moves keyboard focus along the focus chain, as Tab does, and
+//   `focusreport` logs whether the focused control lies inside the scroll
+//   viewport. `focusall` walks the whole chain once from the start and logs every
+//   stop; a body control that is not fully in view is counted in bodyOutOfView.
+//   `buttons` logs each visible control with its label, accessible name and
+//   enabled state. `audit` logs controls that leave the card or the screen, or
+//   that the scroll viewport cuts. `click` emits the nth visible, enabled control
+//   whose text is LABEL, the path a pointer press takes. `shot` crops the popup
+//   (plus a margin, so its border shows) with grim.
+//   Every open and close is logged as `STEP opened=`. Outside presses cannot
+//   close the popup in this harness (see isolate-dismiss.py), so a close here is
+//   only the harness's own close or an error.
 ShellRoot {
   id: harness
   readonly property string wanted: Quickshell.env("OMADROP_SCREEN") || ""
@@ -68,6 +77,11 @@ ShellRoot {
         panel.card.WlrLayershell.keyboardFocus = WlrKeyboardFocus.None
         var h = parseInt(Quickshell.env("OMADROP_MAXH") || "0")
         if (h > 0) panel.maxContentHeight = h
+        // Shorter startup bounds run the same stall and timeout logic in seconds.
+        var su = parseInt(Quickshell.env("OMADROP_STARTUP_SECONDS") || "0")
+        if (su > 0) panel.startupSeconds = su
+        var lu = parseInt(Quickshell.env("OMADROP_LEASE_SECONDS") || "0")
+        if (lu > 0) panel.leaseLimitSeconds = lu
       }
     }
   }
@@ -107,7 +121,8 @@ ShellRoot {
     // Depth-first, document order; returns the skip-th match.
     var found = { n: skip, hit: null }
     function visit(it) {
-      if (!it || found.hit) return
+      // A hidden parent hides its children too, so their own `visible` is not enough.
+      if (!it || !it.visible || found.hit) return
       if (it.visible && it.enabled !== false && it.text === label && typeof it.clicked === "function") {
         if (found.n === 0) { found.hit = it; return }
         found.n--
@@ -161,6 +176,91 @@ ShellRoot {
     console.log("STEP audit n=" + n + " outside=" + outside.length + " " + JSON.stringify(outside) + " scrollCut=" + JSON.stringify(cut))
   }
 
+  // The scroll viewport that holds the popup body, found as `audit` finds it.
+  function bodyFlick(v) {
+    var found = null
+    function find(it) {
+      if (found || !it) return
+      if (it.contentHeight !== undefined && it.contentY !== undefined && it.visible) { found = it; return }
+      var kids = it.children || []
+      for (var i = 0; i < kids.length; i++) find(kids[i])
+    }
+    find(v)
+    return found
+  }
+
+  // Tab, n times: each press moves focus to the next control in the focus chain.
+  function focusNext(n) {
+    for (var k = 0; k < n; k++) {
+      var cur = panel.body.Window.activeFocusItem
+      var nxt = cur ? cur.nextItemInFocusChain(true) : panel.body.nextItemInFocusChain(true)
+      if (nxt) nxt.forceActiveFocus()
+    }
+  }
+
+  // Where a focused control sits. A control in the scrolling body must lie fully
+  // inside the viewport; a control in the fixed header or footer is always shown.
+  function placeOf(cur) {
+    var label = cur.text !== undefined ? cur.text : "?"
+    var flick = bodyFlick(panel.body)
+    if (!flick) return { ok: true, line: label + " scope=none" }
+    // Only controls inside the scrolling viewport count; the view itself is the
+    // whole popup, so the test is for the Flickable and not for the view.
+    var inBody = false
+    for (var it = cur; it; it = it.parent) if (it === flick) { inBody = true; break }
+    if (!inBody) return { ok: true, line: label + " scope=fixed" }
+    var p = cur.mapToItem(flick, 0, 0)
+    var inView = p.y >= 0 && p.y + cur.height <= flick.height
+    return { ok: inView, line: label + " scope=body y=" + Math.round(p.y) + " h=" + Math.round(cur.height)
+      + " viewport=" + Math.round(flick.height) + " inView=" + inView }
+  }
+
+  function focusReport() {
+    var cur = panel.body.Window.activeFocusItem
+    if (!cur) { console.log("STEP focus none"); return }
+    console.log("STEP focus " + placeOf(cur).line)
+  }
+
+  // Tab once through the whole focus chain from its start, logging each stop. The
+  // walk ends when the chain returns to the start.
+  function focusAll() {
+    var start = panel.body
+    var cur = start
+    var visited = []
+    var seen = 0, bad = 0
+    for (var k = 0; k < 400; k++) {
+      var nxt = cur.nextItemInFocusChain(true)
+      // The chain may wrap to an item other than the start, so stop at any repeat.
+      if (!nxt || nxt === start || visited.indexOf(nxt) >= 0) break
+      visited.push(nxt)
+      nxt.forceActiveFocus()
+      cur = nxt
+      seen++
+      var r = placeOf(nxt)
+      if (!r.ok) bad++
+      console.log("STEP focusall " + r.line)
+    }
+    console.log("STEP focusall n=" + seen + " bodyOutOfView=" + bad)
+  }
+
+  // Every visible control with its label, accessible name and enabled state.
+  function listButtons(v) {
+    var n = 0
+    function visit(it) {
+      if (!it || !it.visible) return
+      // Buttons carry a text; the unlabeled clicked handlers inside them are skipped.
+      if (it.text !== undefined && typeof it.clicked === "function" && it.width > 0) {
+        n++
+        var name = it.Accessible ? it.Accessible.name : ""
+        console.log("STEP btn " + (it.text || "?") + " | " + (name || "") + " | enabled=" + it.enabled)
+      }
+      var kids = it.children || []
+      for (var i = 0; i < kids.length; i++) visit(kids[i])
+    }
+    visit(v)
+    console.log("STEP buttons n=" + n)
+  }
+
   function runStep(step) {
     var i = step.indexOf(":")
     var name = i < 0 ? step : step.substring(0, i)
@@ -197,6 +297,8 @@ ShellRoot {
         opened: panel.opened, tab: v.tab, staged: panel.staged.map(function(f) { return f.name }),
         staging: panel.staging, sendingPeer: panel.sendingPeer, actionError: panel.actionError,
         leaseError: panel.leaseError, mode: v.mode, leaseWanted: panel.leaseWanted,
+        startupWaiting: panel.startupWaiting, startupStalled: panel.startupStalled,
+        startupFailed: panel.startupFailed, starting: panel.backendStarting,
         notifications: Object.keys(panel.notificationJobs).map(function(id) {
           return panel.notificationJobs[id] ? panel.notificationJobs[id].notificationId : 0
         }),
@@ -204,11 +306,23 @@ ShellRoot {
         h: panel.card.contentHeight, w: panel.card.contentWidth, avail: panel.card.availableCardHeight }))
       break
     case "audit": audit(v); break
+    case "focusnext": focusNext(parseInt(arg)); break
+    case "focusreport": focusReport(); break
+    case "focusall": focusAll(); break
+    case "buttons": listButtons(v); break
     case "scroll": v.scrollBy(parseInt(arg)); break
     case "shot": harness.shotPath = arg; shot.running = true; return 700
     case "wait": return parseInt(arg)
     }
     return 400
+  }
+
+  Connections {
+    target: panel
+    function onOpenedChanged() { console.log("STEP opened=" + panel.opened) }
+    function onStartupWaitingChanged() { console.log("STEP startup waiting=" + panel.startupWaiting) }
+    function onStartupStalledChanged() { console.log("STEP startup stalled=" + panel.startupStalled) }
+    function onStartupFailedChanged() { console.log("STEP startup failed=" + panel.startupFailed + " error=" + panel.leaseError) }
   }
 
   Timer {
@@ -241,6 +355,6 @@ ShellRoot {
       if (cap > 0) h = Math.min(h, cap)
       return ["grim", "-g", (s.x + x) + "," + (s.y + y) + " " + w + "x" + h, harness.shotPath]
     }
-    onExited: console.log("STEP shot " + harness.shotPath + " exit=" + exitCode)
+    onExited: function(code) { console.log("STEP shot " + harness.shotPath + " exit=" + code) }
   }
 }

@@ -420,6 +420,10 @@ class LocalSendTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(response.status, 200)
             self.assertEqual(self.service.quick_active, new_key)
+            for _ in range(100):
+                if accepted.exists():
+                    break
+                await asyncio.sleep(0.01)
             self.assertEqual(accepted.read_text(), "new-inbound")
 
             self.service.quick_transfer(
@@ -500,6 +504,108 @@ class LocalSendTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((self.directory / source.name).read_bytes(), expected)
         self.assertFalse(source.exists())
         self.assertFalse(staging.exists())
+        self.assertIsNone(self.service.quick_active)
+
+    async def test_slow_quickshare_publication_progress_resets_idle_watchdog(self):
+        self.directory.mkdir()
+        staging = Path(self.temp.name) / "quickshare-slow-publication"
+        staging.mkdir()
+        source = staging / "large.bin"
+        content = b"x" * (1024 * 1024)
+        source.write_bytes(content)
+        key = "quickshare:slow-publication"
+        self.service.quick_staging = staging
+        self.service.quick_files[key] = [source.name]
+        self.service.transfers[key] = omadrop.Transfer({
+            "id": key, "name": source.name, "fileName": source.name,
+            "peer": "Test phone", "protocol": "quickshare", "direction": "in",
+            "bytes": 0, "total": len(content), "state": "transferring",
+            "error": "", "files": 1,
+        })
+        self.service.quick_active = key
+
+        async def paced_copy():
+            await asyncio.sleep(0.03)
+
+        publication = self.service.spawn_quick_publication(key)
+
+        async def monitor():
+            while not publication.done():
+                await asyncio.sleep(0.01)
+                await self.service.expire_stalled_transfers()
+
+        with patch.object(omadrop, "TRANSFER_IDLE_TIMEOUT", 0.05), patch.object(
+            self.service, "quick_publication_checkpoint", new=paced_copy
+        ):
+            watcher = asyncio.create_task(monitor())
+            try:
+                await asyncio.wait_for(publication, 3)
+            finally:
+                watcher.cancel()
+                await asyncio.gather(watcher, return_exceptions=True)
+
+        self.assertEqual(self.service.transfers[key]["state"], "complete")
+        self.assertEqual((self.directory / source.name).read_bytes(), content)
+        self.assertFalse(source.exists())
+        self.assertNotIn(key, self.service.quick_publication_progress)
+        self.assertIsNone(self.service.quick_active)
+
+    async def test_stalled_quickshare_publication_cancels_without_touching_destination(self):
+        self.directory.mkdir()
+        staging = Path(self.temp.name) / "quickshare-stalled-publication"
+        staging.mkdir()
+        source = staging / "large.bin"
+        source.write_bytes(b"x" * (1024 * 1024))
+        unrelated = staging / "unrelated.bin"
+        unrelated.write_bytes(b"keep staged data")
+        destination = self.directory / source.name
+        destination.write_bytes(b"keep existing destination")
+        key = "quickshare:stalled-publication"
+        self.service.quick_staging = staging
+        self.service.quick_files[key] = [source.name]
+        self.service.transfers[key] = omadrop.Transfer({
+            "id": key, "name": source.name, "fileName": source.name,
+            "peer": "Test phone", "protocol": "quickshare", "direction": "in",
+            "bytes": 0, "total": source.stat().st_size, "state": "transferring",
+            "error": "", "files": 1,
+        })
+        self.service.quick_active = key
+        entered_copy = asyncio.Event()
+
+        async def block_copy():
+            entered_copy.set()
+            await asyncio.Event().wait()
+
+        publication = self.service.spawn_quick_publication(key)
+
+        async def monitor():
+            while not publication.done():
+                await asyncio.sleep(0.01)
+                await self.service.expire_stalled_transfers()
+
+        with patch.object(omadrop, "TRANSFER_IDLE_TIMEOUT", 0.05), patch.object(
+            self.service, "quick_publication_checkpoint", new=block_copy
+        ):
+            watcher = asyncio.create_task(monitor())
+            try:
+                await asyncio.wait_for(entered_copy.wait(), 2)
+                await asyncio.wait_for(watcher, 2)
+            finally:
+                if not watcher.done():
+                    watcher.cancel()
+                    await asyncio.gather(watcher, return_exceptions=True)
+                if not publication.done():
+                    publication.cancel()
+                    await asyncio.gather(publication, return_exceptions=True)
+
+        self.assertEqual(self.service.transfers[key]["state"], "failed")
+        self.assertIn("without progress", self.service.transfers[key]["error"])
+        self.assertEqual(destination.read_bytes(), b"keep existing destination")
+        self.assertFalse((self.directory / "large (1).bin").exists())
+        self.assertFalse(list(self.directory.glob(".omadrop-*.part")))
+        self.assertFalse(source.exists())
+        self.assertEqual(unrelated.read_bytes(), b"keep staged data")
+        self.assertNotIn(key, self.service.quick_publication_progress)
         self.assertIsNone(self.service.quick_active)
 
     async def test_stale_quickshare_process_exit_does_not_touch_replacement(self):
@@ -596,13 +702,121 @@ class LocalSendTests(unittest.IsolatedAsyncioTestCase):
         try:
             self.service.local_addresses = ["127.0.0.2"]
             with patch.object(omadrop, "PORT", server.port):
-                await omadrop.Coordinator.discover_local(self.service)
+                await omadrop.Coordinator.discover_local(self.service, ["127.0.0.1"])
             peer = self.service.peers["localsend:test-phone"]
             self.assertEqual(peer["host"], "127.0.0.1")
             self.assertEqual(peer["scheme"], "http")
             self.assertEqual(peer["name"], "Test phone")
         finally:
             await server.close()
+
+    async def test_https_register_uses_listening_certificate_instead_of_json_identity(self):
+        # Model LocalSend's allowed omission of fingerprint in HTTPS register.
+        actual_fingerprint = self.service.fingerprint
+        self.service.fingerprint = "different-local-identity"
+        response = await self.client.post(self.url + "/register", json={
+            "alias": "Test peer", "version": "2.2", "protocol": "https",
+            "port": self.port, "fingerprint": "untrusted-json-identity",
+        })
+        self.assertEqual(response.status, 200)
+        self.assertIn("localsend:" + actual_fingerprint, self.service.peers)
+        self.assertNotIn("localsend:untrusted-json-identity", self.service.peers)
+
+    async def test_multicast_socket_failure_keeps_https_receiver_available(self):
+        await self.service.stop()
+        real_socket = socket.socket
+
+        def socket_with_unavailable_multicast(*args, **kwargs):
+            sock = real_socket(*args, **kwargs)
+            if len(args) > 1 and args[1] == socket.SOCK_DGRAM:
+                from unittest.mock import Mock
+                blocked = Mock(wraps=sock)
+                blocked.bind.side_effect = OSError("Multicast port unavailable")
+                return blocked
+            return sock
+
+        with patch.object(omadrop.socket, "socket", new=socket_with_unavailable_multicast):
+            await self.service.start()
+        self.assertIsNone(self.service.udp)
+        self.assertEqual(self.service.channels["localsend"]["state"], "advertising")
+        self.assertIn("LAN discovery", self.service.channels["localsend"]["reason"])
+        async with self.client.get(self.url + "/info") as response:
+            self.assertEqual(response.status, 200)
+
+    async def test_start_publishes_menu_state_and_runs_protocol_setup_concurrently(self):
+        await self.service.stop()
+        entered = set()
+        all_entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def start_channel(key):
+            entered.add(key)
+            if len(entered) == 3:
+                all_entered.set()
+            await release.wait()
+            self.service.channel(key, "advertising")
+
+        with patch.object(self.service, "start_local", new=lambda: start_channel("localsend")), patch.object(
+            self.service, "start_quick", new=lambda: start_channel("quickshare")
+        ), patch.object(self.service, "start_airdrop", new=lambda: start_channel("airdrop")):
+            task = asyncio.create_task(self.control.post("/", json={
+                "command": "lease", "leaseId": "starting-test", "durationSeconds": 30,
+            }))
+            try:
+                await asyncio.wait_for(all_entered.wait(), 2)
+                status = self.service.snapshot()
+                self.assertEqual(status["mode"], "menu")
+                self.assertTrue(status["starting"])
+            finally:
+                release.set()
+            response = await task
+        self.assertEqual(response.status, 200)
+        self.assertFalse((await response.json())["starting"])
+
+    async def test_stalled_protocol_setup_is_bounded_without_hiding_ready_channels(self):
+        await self.service.stop()
+
+        async def ready(key):
+            self.service.channel(key, "advertising")
+
+        async def stalled():
+            await asyncio.Event().wait()
+
+        with patch.object(omadrop, "PROTOCOL_STARTUP_TIMEOUT", 0.05), patch.object(
+            self.service, "start_local", new=lambda: ready("localsend")
+        ), patch.object(self.service, "start_airdrop", new=lambda: ready("airdrop")), patch.object(
+            self.service, "start_quick", new=stalled
+        ):
+            response = await asyncio.wait_for(self.control.post("/", json={
+                "command": "lease", "leaseId": "bounded-start", "durationSeconds": 30,
+            }), 2)
+        status = await response.json()
+        self.assertEqual(status["mode"], "menu")
+        self.assertFalse(status["starting"])
+        channels = {row["id"]: row for row in status["protocols"]}
+        self.assertEqual(channels["localsend"]["state"], "advertising")
+        self.assertEqual(channels["quickshare"]["state"], "unavailable")
+        self.assertEqual(channels["quickshare"]["reason"], "Startup timed out")
+
+    async def test_cancelled_startup_cleans_started_resources_and_states(self):
+        await self.service.stop()
+        waiting = asyncio.Event()
+
+        async def stalled():
+            waiting.set()
+            await asyncio.Event().wait()
+
+        with patch.object(self.service, "start_quick", new=stalled):
+            starting = asyncio.create_task(self.service.start())
+            await asyncio.wait_for(waiting.wait(), 2)
+            starting.cancel()
+            await asyncio.gather(starting, return_exceptions=True)
+        self.assertTrue(starting.cancelled())
+        self.assertFalse(self.service.running)
+        self.assertFalse(self.service.starting)
+        self.assertIsNone(self.service.client)
+        self.assertIsNone(self.service.local_runner)
+        self.assertTrue(all(row["state"] == "stopped" for row in self.service.channels.values()))
 
     async def test_airdrop_sender_disconnect_removes_pending_approval(self):
         task = asyncio.create_task(self.control.post("/", json={
@@ -1199,6 +1413,7 @@ class LocalSendTests(unittest.IsolatedAsyncioTestCase):
         await self.control.post("/", json={"command": "dismiss", "id": "all"})
         self.assertNotIn("done", self.service.transfers)
         self.assertIn("active", self.service.transfers)
+        self.assertEqual(omadrop.Coordinator().transfers, {})
 
     async def test_send_response_contains_queued_transfer_and_later_failure(self):
         source = Path(self.temp.name) / "send-test.txt"
@@ -1639,6 +1854,26 @@ class LocalSendTests(unittest.IsolatedAsyncioTestCase):
         self.service.incoming["quickshare:test"] = {"decision": None, "public": {}}
         await self.service.stop()
         self.assertFalse(self.service.running)
+
+    async def test_stop_reports_airdrop_shutdown_failure_and_preserves_ownership(self):
+        self.service.airdrop_owned = True
+        with patch.object(
+            omadrop,
+            "run_command",
+            new=AsyncMock(side_effect=RuntimeError("radio restoration failed")),
+        ):
+            response = await self.control.post("/", json={"command": "stop"})
+
+        self.assertEqual(response.status, 400)
+        self.assertIn("Could not stop AirDrop", (await response.json())["error"])
+        self.assertTrue(self.service.airdrop_owned)
+        self.assertEqual(self.service.channels["airdrop"]["state"], "unavailable")
+        self.assertIn("radio restoration failed", self.service.channels["airdrop"]["reason"])
+
+        with patch.object(omadrop, "run_command", new=AsyncMock(return_value="")):
+            await self.service.stop()
+        self.assertFalse(self.service.airdrop_owned)
+        self.assertEqual(self.service.channels["airdrop"]["state"], "stopped")
 
     async def test_real_outgoing_localsend_transfer(self):
         receiver = LocalOnly()

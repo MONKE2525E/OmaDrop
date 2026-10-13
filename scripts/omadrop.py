@@ -12,6 +12,7 @@ import fcntl
 import hashlib
 import ipaddress
 import json
+import math
 import mimetypes
 import os
 import secrets
@@ -40,6 +41,11 @@ PORT = 53317
 QUICK_PORT = 53318
 API = "/api/localsend/v2"
 ACTIVE_STATES = {"preparing", "waiting", "transferring"}
+FINISHED_STATES = {"complete", "failed", "cancelled", "rejected"}
+TRANSFER_HISTORY_TTL = 3 * 60 * 60
+DISCOVERY_SCAN_LIMIT = 512
+DISCOVERY_INTERVAL = 10
+PROTOCOL_STARTUP_TIMEOUT = 60
 LOCALSEND_SESSION_IDLE_TIMEOUT = 600
 LOCALSEND_UPLOAD_IDLE_TIMEOUT = 300
 LOCALSEND_RESPONSE_IDLE_TIMEOUT = 300
@@ -75,16 +81,56 @@ class Transfer(dict):
         super().__init__(*args, **kwargs)
         self.setdefault("files", 1)
         self.setdefault("fileName", self.get("name", "Transfer"))
-        self["updated"] = time.time()
+        self.on_change = None
+        self.setdefault("updated", time.time())
+        if self.get("state") in FINISHED_STATES:
+            self.setdefault("completedAt", self["updated"])
+
+    def changed(self, previous_state):
+        now = time.time()
+        super().__setitem__("updated", now)
+        if self.get("state") in FINISHED_STATES:
+            if previous_state not in FINISHED_STATES:
+                super().__setitem__("completedAt", now)
+        else:
+            super().pop("completedAt", None)
+        if self.on_change and (self.get("state") in FINISHED_STATES or previous_state in FINISHED_STATES):
+            self.on_change()
 
     def __setitem__(self, key, value):
+        previous_state = self.get("state")
         super().__setitem__(key, value)
         if key != "updated":
-            super().__setitem__("updated", time.time())
+            self.changed(previous_state)
 
     def update(self, *args, **kwargs):
+        previous_state = self.get("state")
         super().update(*args, **kwargs)
-        super().__setitem__("updated", time.time())
+        self.changed(previous_state)
+
+
+class TransferHistory(dict):
+    def __init__(self, on_change):
+        super().__init__()
+        self.on_change = on_change
+
+    def __setitem__(self, key, value):
+        if not isinstance(value, Transfer):
+            value = Transfer(value)
+        value.on_change = self.on_change
+        super().__setitem__(key, value)
+        if value.get("state") in FINISHED_STATES:
+            self.on_change()
+
+    def update(self, *args, **kwargs):
+        for key, value in dict(*args, **kwargs).items():
+            self[key] = value
+
+    def pop(self, key, *default):
+        value = super().pop(key, *default)
+        if value is not None:
+            self.on_change()
+        return value
 
 
 def menu_lease_id(packet):
@@ -101,21 +147,25 @@ def menu_lease_id(packet):
     return lease_id
 
 
-async def lan_addresses():
+async def lan_interfaces():
     try:
         interfaces = json.loads(await run_command("ip", "-j", "-4", "address", "show", "up", timeout=3))
         addresses = []
         for interface in interfaces:
             name = interface.get("ifname", "")
-            if name.startswith(("lo", "tailscale", "docker", "veth", "br-", "virbr", "awdl", "omgo", "mon", "tun", "tap", "wg")):
+            if name.startswith(("lo", "tailscale", "docker", "veth", "br-", "virbr", "awdl", "omgo", "mon", "tun", "tap", "wg")) or "POINTOPOINT" in interface.get("flags", []):
                 continue
             for row in interface.get("addr_info", []):
                 address = ipaddress.ip_address(row["local"])
                 if address.version == 4 and address.is_private and not address.is_loopback and not address.is_link_local:
-                    addresses.append(str(address))
-        return sorted(set(addresses))[:8]
-    except (RuntimeError, TimeoutError, ValueError, KeyError):
+                    addresses.append({"address": str(address), "prefixlen": row["prefixlen"], "name": name})
+        return addresses[:8]
+    except (OSError, RuntimeError, TimeoutError, ValueError, KeyError, TypeError):
         return []
+
+
+async def lan_addresses():
+    return sorted({row["address"] for row in await lan_interfaces()})
 
 
 def runtime_dir(create=True):
@@ -389,8 +439,9 @@ class Discovery(asyncio.DatagramProtocol):
         try:
             packet = json.loads(data)
             peer = self.owner.register_peer(packet, addr[0])
-            if peer and packet.get("announce") is True:
-                self.owner.spawn(self.owner.register_remote(peer))
+            # Current LocalSend v2.2 announcements omit this legacy field.
+            if peer and packet.get("announce", True) is True:
+                self.owner.reply_to_announcement(peer)
         except (ValueError, TypeError, KeyError):
             pass
 
@@ -399,18 +450,24 @@ class Coordinator:
     def __init__(self):
         self.settings = read_settings()
         self.running = False
+        self.starting = False
         self.channels = {
             key: {"id": key, "name": name, "state": "stopped", "reason": ""}
             for key, name in PROTOCOLS
         }
         self.peers = {}
         self.incoming = {}
-        self.transfers = {}
+        self.loading_history = True
+        self.transfers = TransferHistory(self.save_history)
         self.sessions = {}
         self.tasks = set()
         self.local_runner = None
         self.udp = None
         self.local_addresses = []
+        self.local_interfaces = []
+        self.local_memberships = set()
+        self.local_scan_offsets = {}
+        self.local_registration_tasks = {}
         self.local_scan = None
         self.local_scan_at = 0
         self.quick = None
@@ -419,6 +476,7 @@ class Coordinator:
         self.quick_files = {}
         self.quick_text = {}
         self.quick_publications = {}
+        self.quick_publication_progress = {}
         self.quick_transfer_processes = {}
         self.quick_transfer_staging = {}
         self.quick_process_staging = {}
@@ -441,6 +499,54 @@ class Coordinator:
             or shutil.which("omadrop-quickshare")
             or str(Path(__file__).with_name("omadrop-quickshare"))
         )
+        self.load_history()
+
+    def load_history(self):
+        path = config_dir() / "transfers.json"
+        try:
+            rows = json.loads(path.read_text()) if path.exists() else []
+            if not isinstance(rows, list):
+                raise ValueError("Invalid transfer history")
+            for row in rows:
+                if not isinstance(row, dict) or row.get("state") not in FINISHED_STATES or not isinstance(row.get("id"), str):
+                    continue
+                completed = row.get("completedAt", row.get("updated", 0))
+                if type(completed) not in (int, float) or not math.isfinite(completed) or completed <= time.time() - TRANSFER_HISTORY_TTL:
+                    continue
+                row["completedAt"] = min(completed, time.time())
+                self.transfers[row["id"]] = Transfer(row)
+        except (OSError, ValueError, TypeError):
+            self.error = "Could not read transfer history"
+        finally:
+            self.loading_history = False
+        self.save_history()
+
+    def save_history(self):
+        if self.loading_history:
+            return
+        fields = {"id", "name", "fileName", "files", "peer", "protocol", "direction", "bytes", "total", "state", "error", "updated", "completedAt"}
+        rows = [{key: value for key, value in row.items() if key in fields}
+                for row in self.transfers.values() if row.get("state") in FINISHED_STATES]
+        try:
+            directory = config_dir()
+            directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+            temporary = directory / "transfers.tmp"
+            temporary.write_text(json.dumps(rows))
+            temporary.chmod(0o600)
+            temporary.replace(directory / "transfers.json")
+        except OSError:
+            self.error = "Could not save transfer history"
+
+    def expire_finished_transfers(self, now=None):
+        now = time.time() if now is None else now
+        expired = [key for key, row in self.transfers.items()
+                   if row.get("state") in FINISHED_STATES
+                   and row.get("completedAt", row.get("updated", 0)) <= now - TRANSFER_HISTORY_TTL]
+        for key in expired:
+            dict.pop(self.transfers, key)
+            self.transfer_watch.pop(key, None)
+        if expired:
+            self.save_history()
 
     def spawn(self, coroutine):
         task = asyncio.create_task(coroutine)
@@ -449,6 +555,7 @@ class Coordinator:
         return task
 
     def spawn_quick_publication(self, key):
+        self.quick_publication_progress[key] = 0
         task = self.spawn(self.publish_quick_files(key))
         task.set_name(key)
         self.quick_publications[key] = task
@@ -462,6 +569,7 @@ class Coordinator:
     def quick_publication_done(self, key, task):
         if self.quick_publications.get(key) is task:
             self.quick_publications.pop(key, None)
+        self.quick_publication_progress.pop(key, None)
         transfer = self.transfers.get(key)
         if task.cancelled() and transfer and transfer.get("state") in (
             "cancelled", "rejected"
@@ -504,6 +612,7 @@ class Coordinator:
         }
 
     def snapshot(self):
+        self.expire_finished_transfers()
         now = time.monotonic()
         active_menu = self.active_menu_leases(time.time())
         # LocalSend has no departure packet. Expire stale announcements.
@@ -525,6 +634,7 @@ class Coordinator:
         ]
         return {
             "running": self.running,
+            "starting": self.starting,
             "mode": "window" if self.settings.get("advertiseUntil", 0) > time.time()
             else "menu" if active_menu else "off",
             "remainingSeconds": max(0, int(self.settings["advertiseUntil"] - time.time()))
@@ -543,21 +653,32 @@ class Coordinator:
             await self.refresh_airdrop()
             return
         self.running = True
+        self.starting = True
         self.error = ""
         self.client = aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=120, connect=5),
             connector=LocalSendConnector(limit=32),
         )
-        for key, starter in (
-            ("localsend", self.start_local),
-            ("quickshare", self.start_quick),
-            ("airdrop", self.start_airdrop),
-        ):
+        async def start_channel(key, starter):
             self.channel(key, "starting")
             try:
-                await starter()
+                async with asyncio.timeout(PROTOCOL_STARTUP_TIMEOUT):
+                    await starter()
             except Exception as error:
-                self.channel(key, "unavailable", str(error)[:240])
+                self.channel(key, "unavailable", str(error)[:240] or "Startup timed out")
+        try:
+            await asyncio.gather(*(start_channel(key, starter) for key, starter in (
+                ("localsend", self.start_local), ("quickshare", self.start_quick),
+                ("airdrop", self.start_airdrop),
+            )))
+        except BaseException:
+            try:
+                await self.stop()
+            except RuntimeError:
+                pass
+            raise
+        finally:
+            self.starting = False
         self.spawn(self.maintenance())
 
     def arm_window(self):
@@ -587,7 +708,12 @@ class Coordinator:
             if self.menu_leases or self.settings.get("advertiseUntil", 0):
                 self.arm_window()
             else:
-                await self.stop()
+                try:
+                    await self.stop()
+                except RuntimeError:
+                    # stop() records the failed radio shutdown for the UI;
+                    # don't leave an unhandled exception in the timer task.
+                    pass
 
     async def restore_window(self):
         if self.settings.get("enabled") is True and self.settings.get("advertiseUntil", 0) > time.time():
@@ -599,6 +725,7 @@ class Coordinator:
 
     async def stop(self):
         self.running = False
+        self.starting = False
         self.menu_leases.clear()
         if self.window_timer is not None:
             self.window_timer.cancel()
@@ -637,21 +764,31 @@ class Coordinator:
         self.quick_transfer_staging.clear()
         self.quick_process_staging.clear()
         self.quick_exit_watchers.clear()
+        self.quick_publication_progress.clear()
         self.airdrop_sends.clear()
         self.airdrop_progress.clear()
         if self.udp:
             self.udp.close()
             self.udp = None
+        self.local_memberships.clear()
+        self.local_registration_tasks.clear()
         if self.local_runner:
             await self.local_runner.cleanup()
             self.local_runner = None
         if self.client:
             await self.client.close()
             self.client = None
+        airdrop_stop_error = None
         if self.airdrop_owned:
-            with contextlib.suppress(Exception):
+            try:
                 await run_command("omdrop", "off", timeout=20)
-            self.airdrop_owned = False
+            except Exception as error:
+                airdrop_stop_error = error
+                self.error = f"Could not stop AirDrop: {str(error)[:200] or 'radio did not stop'}"
+            else:
+                self.airdrop_owned = False
+                if self.error.startswith("Could not stop AirDrop:"):
+                    self.error = ""
         self.peers.clear()
         self.incoming.clear()
         self.sessions.clear()
@@ -660,6 +797,9 @@ class Coordinator:
                 transfer.update(state="cancelled")
         for key, _ in PROTOCOLS:
             self.channel(key, "stopped")
+        if airdrop_stop_error is not None:
+            self.channel("airdrop", "unavailable", self.error)
+            raise RuntimeError(self.error) from airdrop_stop_error
 
     async def start_local(self):
         directory = config_dir()
@@ -706,47 +846,108 @@ class Coordinator:
         await runner.setup()
         try:
             await web.TCPSite(runner, "0.0.0.0", self.port, ssl_context=tls).start()
+        except BaseException:
+            await runner.cleanup()
+            raise
+        multicast_reason = ""
+        try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             sock.bind(("", self.port))
-            self.local_addresses = await lan_addresses()
-            for address in self.local_addresses or ["0.0.0.0"]:
-                sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP,
-                                socket.inet_aton(GROUP) + socket.inet_aton(address))
+            self.local_interfaces = await lan_interfaces()
+            self.local_addresses = sorted({row["address"] for row in self.local_interfaces})
+            for address in self.local_addresses:
+                try:
+                    sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP,
+                                    socket.inet_aton(GROUP) + socket.inet_aton(address))
+                    self.local_memberships.add(address)
+                except OSError:
+                    continue
             sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 1)
             sock.setblocking(False)
             self.udp, _ = await asyncio.get_running_loop().create_datagram_endpoint(
                 lambda: Discovery(self), sock=sock
             )
+        except OSError:
+            if "sock" in locals():
+                sock.close()
+            self.local_memberships.clear()
+            self.local_interfaces = await lan_interfaces()
+            self.local_addresses = sorted({row["address"] for row in self.local_interfaces})
+            multicast_reason = "Multicast unavailable; using LAN discovery"
         except BaseException:
             await runner.cleanup()
             if "sock" in locals():
                 sock.close()
             raise
         self.local_runner = runner
-        self.channel("localsend", "advertising")
+        self.channel("localsend", "advertising", multicast_reason)
         self.announce()
+        self.spawn(self.announce_startup())
         self.local_scan_at = time.monotonic()
         self.local_scan = self.spawn(self.discover_local())
+        self.spawn(self.local_maintenance())
 
     def announce(self, announce=True):
         if self.udp:
             sock = self.udp.get_extra_info("socket")
-            for address in self.local_addresses or ["0.0.0.0"]:
+            for address in self.local_addresses:
                 try:
                     sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, socket.inet_aton(address))
                     self.udp.sendto(json.dumps(dict(self.info(), announce=announce)).encode(), (GROUP, self.port))
                 except OSError:
                     continue
 
+    async def announce_startup(self):
+        for delay in (1, 2, 4):
+            await asyncio.sleep(delay)
+            if not self.running:
+                return
+            self.announce()
+
+    async def refresh_local_interfaces(self):
+        interfaces = await lan_interfaces()
+        addresses = {row["address"] for row in interfaces}
+        if self.udp:
+            sock = self.udp.get_extra_info("socket")
+            for address in self.local_memberships - addresses:
+                with contextlib.suppress(OSError):
+                    sock.setsockopt(socket.IPPROTO_IP, socket.IP_DROP_MEMBERSHIP,
+                                    socket.inet_aton(GROUP) + socket.inet_aton(address))
+                self.local_memberships.discard(address)
+            for address in addresses - self.local_memberships:
+                try:
+                    sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP,
+                                    socket.inet_aton(GROUP) + socket.inet_aton(address))
+                    self.local_memberships.add(address)
+                except OSError:
+                    continue
+        self.local_interfaces = interfaces
+        self.local_addresses = sorted(addresses)
+
+    def discovery_hosts(self):
+        networks = {}
+        for row in self.local_interfaces:
+            interface = ipaddress.ip_interface(f"{row['address']}/{row['prefixlen']}")
+            networks.setdefault(interface.network, interface.ip)
+        hosts = set()
+        allowance = max(1, DISCOVERY_SCAN_LIMIT // max(1, len(networks)))
+        for network, address in networks.items():
+            # Start near this device, then rotate through larger real subnets.
+            # Never turn a /8 into millions of tasks or scan outside the LAN.
+            first = int(network.network_address) + (1 if network.prefixlen < 31 else 0)
+            count = network.num_addresses - (2 if network.prefixlen < 31 else 0)
+            start = self.local_scan_offsets.get(str(network), max(0, (int(address) & ~255) - first)) % count
+            for offset in range(min(count, allowance)):
+                hosts.add(str(ipaddress.IPv4Address(first + (start + offset) % count)))
+            self.local_scan_offsets[str(network)] = (start + allowance) % count
+        return hosts - set(self.local_addresses)
+
     async def discover_local(self, hosts=None):
         # LocalSend's HTTP fallback handles access points suppressing multicast.
-        # Bound discovery to private, directly connected /24s, never VPNs or WAN.
+        # Bound each pass to directly connected subnets, never VPNs or WAN.
         if hosts is None:
-            hosts = set()
-            for address in self.local_addresses:
-                network = ipaddress.ip_network(address + "/24", strict=False)
-                hosts.update(str(host) for host in network.hosts())
+            hosts = self.discovery_hosts()
         else:
             hosts = set(hosts)
         hosts.difference_update(self.local_addresses)
@@ -759,15 +960,7 @@ class Coordinator:
                         # Discovery is unauthenticated by design. Pin the certificate
                         # actually presented here for all subsequent upload requests.
                         if scheme == "https":
-                            reader, writer = await asyncio.wait_for(asyncio.open_connection(
-                                host, PORT, ssl=self.local_client_tls, server_hostname=host), 1)
-                            try:
-                                certificate = writer.get_extra_info("ssl_object").getpeercert(binary_form=True)
-                                fingerprint = hashlib.sha256(certificate).hexdigest()
-                            finally:
-                                writer.close()
-                                with contextlib.suppress(Exception):
-                                    await asyncio.wait_for(writer.wait_closed(), 1)
+                            fingerprint = await self.certificate_fingerprint(host, PORT)
                             tls = aiohttp.Fingerprint(bytes.fromhex(fingerprint))
                         else:
                             tls, fingerprint = None, None
@@ -785,9 +978,25 @@ class Coordinator:
                             return
                     except (OSError, TimeoutError, aiohttp.ClientError, ValueError, TypeError):
                         continue
-        await asyncio.gather(*(discover(host) for host in sorted(hosts)[:512]))
+        await asyncio.gather(*(discover(host) for host in sorted(hosts)[:DISCOVERY_SCAN_LIMIT]))
+
+    async def certificate_fingerprint(self, host, port):
+        _, writer = await asyncio.wait_for(asyncio.open_connection(
+            host, port, ssl=self.local_client_tls, server_hostname=host), 1)
+        try:
+            certificate = writer.get_extra_info("ssl_object").getpeercert(binary_form=True)
+            return hashlib.sha256(certificate).hexdigest()
+        finally:
+            writer.close()
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(writer.wait_closed(), 1)
 
     def register_peer(self, packet, address):
+        if not isinstance(packet, dict):
+            raise ValueError("Invalid LocalSend announcement")
+        version = str(packet.get("version", "2.0"))
+        if version.split(".", 1)[0] != "2":
+            raise ValueError("Unsupported LocalSend protocol version")
         address = peer_address(address)
         fingerprint = str(packet.get("fingerprint", ""))[:128]
         if not fingerprint or fingerprint == self.fingerprint:
@@ -806,6 +1015,7 @@ class Coordinator:
             "scheme": packet["protocol"],
             "seen": time.monotonic(),
             "fingerprint": fingerprint,
+            "version": version,
         }
         if len(self.peers) < 256 or peer_id in self.peers:
             self.peers[peer_id] = peer
@@ -841,15 +1051,49 @@ class Coordinator:
                 packet = await response.json()
                 packet.update(protocol=peer["scheme"], port=peer["port"], fingerprint=peer["fingerprint"])
                 self.register_peer(packet, peer["host"])
-        except (TimeoutError, aiohttp.ClientError, ValueError):
+        except (OSError, TimeoutError, aiohttp.ClientError, ValueError, TypeError):
             self.announce(False)
+
+    def reply_to_announcement(self, peer):
+        # Multiple NICs and startup bursts can deliver duplicate packets.
+        task = self.local_registration_tasks.get(peer["id"])
+        if task is not None and not task.done():
+            return
+        task = self.spawn(self.register_remote(peer))
+        self.local_registration_tasks[peer["id"]] = task
+
+        def completed(finished):
+            if self.local_registration_tasks.get(peer["id"]) is finished:
+                self.local_registration_tasks.pop(peer["id"], None)
+
+        task.add_done_callback(completed)
 
     async def local_info(self, request):
         return web.json_response(self.info())
 
     async def local_register(self, request):
         try:
-            self.register_peer(await request.json(), request.remote)
+            packet = await request.json()
+            if not isinstance(packet, dict):
+                raise ValueError("Invalid LocalSend announcement")
+            tls = request.transport.get_extra_info("ssl_object") if request.transport else None
+            certificate = tls.getpeercert(binary_form=True) if tls else None
+            if certificate:
+                packet["fingerprint"] = hashlib.sha256(certificate).hexdigest()
+            elif packet.get("protocol") == "https":
+                # stdlib TLS cannot accept arbitrary self-signed client certs.
+                # Verify the sender's listening certificate instead of trusting
+                # the JSON fingerprint, which HTTPS peers are allowed to omit.
+                address = peer_address(request.remote)
+                port = int(packet.get("port", PORT))
+                if not 1 <= port <= 65535:
+                    raise ValueError("Invalid peer endpoint")
+                try:
+                    packet["fingerprint"] = await self.certificate_fingerprint(address, port)
+                except (OSError, TimeoutError, ValueError):
+                    # The register response still lets a send-only client find us.
+                    return web.json_response(self.info())
+            self.register_peer(packet, request.remote)
         except (ValueError, TypeError, KeyError):
             raise web.HTTPBadRequest()
         return web.json_response(self.info())
@@ -1422,6 +1666,9 @@ class Coordinator:
                         temporary.chmod(0o600)
                         while chunk := source.read(256 * 1024):
                             destination.write(chunk)
+                            self.quick_publication_progress[key] = (
+                                self.quick_publication_progress.get(key, 0) + len(chunk)
+                            )
                             await self.quick_publication_checkpoint()
                             if transfer.get("state") == "cancelled":
                                 raise asyncio.CancelledError
@@ -1548,14 +1795,20 @@ class Coordinator:
     async def maintenance(self):
         while self.running:
             await asyncio.sleep(20)
-            self.announce()
-            if self.local_runner and (self.local_scan is None or self.local_scan.done()) and time.monotonic() - self.local_scan_at >= 60:
-                self.local_scan_at = time.monotonic()
-                self.local_scan = self.spawn(self.discover_local())
             async with self.lock:
                 if self.running:
                     await self.refresh_airdrop()
             self.expire_localsend_sessions()
+
+    async def local_maintenance(self):
+        # AWDL status commands can be slow; they must not delay LAN discovery.
+        while self.running:
+            await asyncio.sleep(DISCOVERY_INTERVAL)
+            await self.refresh_local_interfaces()
+            self.announce()
+            if (self.local_scan is None or self.local_scan.done()) and time.monotonic() - self.local_scan_at >= 60:
+                self.local_scan_at = time.monotonic()
+                self.local_scan = self.spawn(self.discover_local())
 
     async def housekeeping(self):
         while True:
@@ -1566,13 +1819,7 @@ class Coordinator:
                     if transfer and transfer["state"] in ACTIVE_STATES:
                         transfer.update(state="failed", error="AirDrop upload did not start or finish in time")
             await self.expire_stalled_transfers()
-            finished = sorted(
-                (key for key, value in self.transfers.items() if value["state"] not in ACTIVE_STATES),
-                key=lambda key: self.transfers[key].get("updated", 0), reverse=True,
-            )
-            for key in finished[20:]:
-                if self.transfers[key].get("updated", 0) < time.time() - 600:
-                    self.transfers.pop(key, None)
+            self.expire_finished_transfers()
             protected = [path for files in self.outgoing_files.values() for path in files]
             cleanup_old_clipboard(protected)
             await asyncio.sleep(30)
@@ -1590,6 +1837,8 @@ class Coordinator:
                 self.transfer_watch.pop(key, None)
                 continue
             progress = (transfer["state"], transfer.get("bytes", 0))
+            if key in self.quick_publication_progress:
+                progress += (self.quick_publication_progress[key],)
             previous, last_progress = self.transfer_watch.get(key, (progress, now))
             if previous != progress:
                 last_progress = now
@@ -1942,9 +2191,11 @@ class Coordinator:
                         and len(self.menu_leases) >= MAX_MENU_LEASES
                     ):
                         raise ValueError("Too many active menu leases")
-                    if not self.running:
-                        await self.start()
                     self.menu_leases[lease_id] = time.time() + duration
+                    if not self.running:
+                        self.menu_leases[lease_id] += PROTOCOL_STARTUP_TIMEOUT
+                        await self.start()
+                        self.menu_leases[lease_id] = time.time() + duration
                     self.arm_window()
             elif command == "release":
                 async with self.lock:

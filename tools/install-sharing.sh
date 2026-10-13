@@ -32,15 +32,6 @@ ln -sfn "$destination/bin/omadrop" "$HOME/.local/bin/omadrop"
 install -Dm644 "$root/scripts/omadrop.service" "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/omadrop.service"
 systemctl --user daemon-reload
 systemctl --user enable omadrop.service
-# Quick Share must keep a reachable port across visibility windows/restarts.
-# The protocol engine is absent when visibility is off; permit LAN clients only.
-if command -v ufw >/dev/null && sudo ufw status | rg -q '^Status: active'; then
-  for network in 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16; do
-    sudo ufw allow from "$network" to any port 53317 proto tcp comment 'OmaDrop LocalSend LAN'
-    sudo ufw allow from "$network" to any port 53317 proto udp comment 'OmaDrop LocalSend LAN'
-    sudo ufw allow from "$network" to any port 53318 proto tcp comment 'OmaDrop Quick Share LAN'
-  done
-fi
 # The existing on-demand daemon must exit before this service can take its lock.
 # On an upgrade, start the service on the next login rather than stopping transfers.
 if ! pgrep -f "^$environment/bin/python $destination/bin/omadrop.py daemon$" >/dev/null; then
@@ -49,3 +40,4 @@ fi
 OMARCHY_SHELL_IPC_TIMEOUT=15s omarchy-shell shell rescanPlugins
 omarchy bar put monke.omadrop --section right
 echo '[SUCCESS] Installed OmaDrop in the Omarchy bar'
+echo '[INFO] Firewall rules were not changed. See README.md for LAN-scoped LocalSend and Quick Share rules.'

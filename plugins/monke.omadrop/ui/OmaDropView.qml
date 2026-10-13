@@ -33,8 +33,15 @@ Item {
   property bool pickingDirectory: false
   // A quiet, expected outcome of staging (an empty clipboard), not a failure.
   property string stageHint: ""
-  // True while the panel wants the radios on but the backend has not said so.
-  property bool leasing: false
+  // Startup, from the panel: the backend is bringing the radios up, or it has
+  // failed (the watchdog passed its bound, or the start command gave an error).
+  property bool startupWaiting: false
+  property bool startupFailed: false
+  // The start command is still running, so Retry would only queue behind it.
+  property bool leaseBusy: false
+  property int startupSeconds: 65
+  // Share list: the first five files show unless the person asks for all.
+  property bool stageExpanded: false
 
   property int tab: 0
 
@@ -53,7 +60,18 @@ Item {
   signal stopVisibleRequested()
   signal pickDirectoryRequested()
   signal retryRequested()
+  signal retryStartupRequested()
   signal closeRequested()
+
+  // Called by the panel once the backend confirms a Clear, so the row leaves
+  // only when it is really gone and never reappears on the next poll.
+  function markCleared(id) {
+    var c = Object.assign({}, cleared)
+    c[id] = true
+    cleared = c
+  }
+
+  onStagedChanged: if (staged.length <= 5) stageExpanded = false
 
   readonly property color dim: Qt.darker(foreground, 1.55)
   readonly property color rule: Qt.rgba(foreground.r, foreground.g, foreground.b, 0.35)
@@ -80,19 +98,22 @@ Item {
   readonly property var unavailable: protocols.filter(function(p) { return p.state === "unavailable" })
   readonly property int availableCount: protocols.filter(function(p) { return p.state !== "unavailable" }).length
 
-  // Finished transfers the person has cleared. The backend keeps them for a
-  // while; this hides them at once and `dismissRequested` asks it to forget.
+  // Finished transfers the backend has confirmed forgetting (see markCleared).
   property var cleared: ({})
 
-  readonly property var outgoingList: transferList("out")
-  readonly property var incomingList: transferList("in")
+  readonly property var outgoingLive: liveFor("out")
+  readonly property var outgoingDone: finishedFor("out")
+  readonly property var incomingLive: liveFor("in")
+  readonly property var incomingDone: finishedFor("in")
+  readonly property var outgoingList: outgoingLive.concat(outgoingDone)
+  readonly property var incomingList: incomingLive.concat(incomingDone)
 
   readonly property real stagedBytes: staged.reduce(function(sum, f) { return sum + (Number(f.size) > 0 ? Number(f.size) : 0) }, 0)
 
   // Seconds left in an explicit window, counted down locally between polls.
   property real deadlineMs: 0
   property real nowMs: Date.now()
-  readonly property bool hasDeadline: incoming.some(function(i) { return Number(i.expiresAt) > 0 })
+  readonly property bool hasDeadline: incoming.some(function(i) { return expiryAt(i) > 0 })
   readonly property int remaining: windowActive ? Math.max(0, Math.round((deadlineMs - nowMs) / 1000)) : 0
 
   onStatusChanged: {
@@ -109,12 +130,21 @@ Item {
     onTriggered: root.nowMs = Date.now()
   }
 
+  // Startup is checked first: the mode can read "window" or "menu" while the
+  // protocols are still starting, and nothing is visible until they are up.
   readonly property string subtitle: {
     if (!ready) return status === null && backendError === "" ? "Checking" : "Unavailable"
+    if (startupWaiting) return "Starting"
+    if (startupFailed) return "Not started"
     if (windowActive) return "Visible · " + clock(remaining) + " left"
     if (mode === "menu") return "Visible while open"
-    return leasing ? "Starting" : "Not visible"
+    return "Not visible"
   }
+
+  // Why startup failed, in the start command's own words when it gave one.
+  readonly property string startupMessage: leaseError !== "" ? leaseError
+    : leaseBusy ? "The start command has not answered after " + startupSeconds + " seconds."
+    : "Nearby sharing is still off after " + startupSeconds + " seconds."
 
   // How far the scrolling viewport extends past its content; see `flick`.
   readonly property int clipGutter: Style.space(4)
@@ -127,14 +157,16 @@ Item {
     return t.state === "preparing" || t.state === "waiting" || t.state === "transferring"
   }
 
-  function transferList(direction) {
-    var mine = transfers.filter(function(t) { return t.direction === direction })
-    var live = mine.filter(isLive).reverse()
-    var done = mine.filter(function(t) { return !isLive(t) && cleared[t.id] !== true }).reverse().slice(0, 4)
-    return live.concat(done)
+  // Newest first. The four latest finished transfers stay listed as Recent.
+  function liveFor(direction) {
+    return transfers.filter(function(t) { return t.direction === direction && isLive(t) }).reverse()
   }
 
-  function liveCount(list) { return list.filter(isLive).length }
+  function finishedFor(direction) {
+    return transfers.filter(function(t) {
+      return t.direction === direction && !isLive(t) && cleared[t.id] !== true
+    }).reverse().slice(0, 4)
+  }
 
   function protocolName(id) {
     for (var i = 0; i < protocols.length; i++)
@@ -178,11 +210,25 @@ Item {
     return what + "from " + item.name + " via " + protocolName(item.protocol)
   }
 
-  // Seconds until an incoming request lapses, or -1 when the backend gave no
-  // deadline (`expiresAt`, epoch seconds).
-  function incomingSecondsLeft(item) {
+  // `expiresAt` is epoch seconds. Absent or empty means the backend set no
+  // deadline, so the request stays usable (-1). A number is a deadline, and an
+  // explicit 0 or anything that is not a number counts as already lapsed (0).
+  function expiryAt(item) {
+    if (item.expiresAt === undefined || item.expiresAt === null || item.expiresAt === "") return -1
     var at = Number(item.expiresAt)
-    return at > 0 ? Math.max(0, Math.round(at - nowMs / 1000)) : -1
+    return isFinite(at) && at >= 0 ? at : 0
+  }
+
+  // A deadline at or before now has lapsed, and so has an explicit 0.
+  function incomingExpired(item) {
+    var at = expiryAt(item)
+    return at >= 0 && at <= nowMs / 1000
+  }
+
+  // Whole seconds until an incoming request lapses; -1 when it has no deadline.
+  function incomingSecondsLeft(item) {
+    var at = expiryAt(item)
+    return at < 0 ? -1 : Math.max(0, Math.ceil(at - nowMs / 1000))
   }
 
   function transferTitle(t) {
@@ -202,7 +248,7 @@ Item {
     var out = t.direction === "out"
     switch (t.state) {
     case "preparing":    return "Preparing"
-    case "waiting":      return out ? "Waiting for approval" : "Starting"
+    case "waiting":      return out ? "Waiting for approval" : "Waiting for sender"
     case "transferring": return Math.round(transferFraction(t) * 100) + "%"
     case "complete":     return out ? "Sent" : "Saved"
     case "rejected":     return out ? "Declined" : "Rejected"
@@ -214,11 +260,18 @@ Item {
 
   function isBusy(id) { return busy[id] === true }
 
-  function dismiss(id) {
-    var c = Object.assign({}, cleared)
-    c[id] = true
-    cleared = c
-    root.dismissRequested(id)
+  // Keeps a control that takes keyboard focus inside the scrolling body, so Tab
+  // never lands on a control the person cannot see. Only body controls count.
+  function revealItem(item) {
+    var inBody = false
+    for (var it = item; it; it = it.parent) if (it === body) { inBody = true; break }
+    if (!inBody) return
+    var top = item.mapToItem(flick.contentItem, 0, 0).y - root.clipGutter
+    var bottom = top + item.height + 2 * root.clipGutter
+    var y = flick.contentY
+    if (top < y) y = top
+    else if (bottom > y + flick.height) y = bottom - flick.height
+    flick.contentY = Math.max(0, Math.min(Math.max(0, flick.contentHeight - flick.height), y))
   }
 
   function scrollBy(dy) {
@@ -249,6 +302,7 @@ Item {
   }
 
   component Btn: Button {
+    id: control
     bordered: true
     focusable: true
     foreground: root.foreground
@@ -259,6 +313,7 @@ Item {
     Accessible.role: Accessible.Button
     Accessible.name: text
     opacity: enabled ? 1.0 : 0.45
+    onActiveFocusChanged: if (activeFocus) root.revealItem(control)
 
     // The kit's focus ring is a faint tint; a full-strength outline keeps the
     // keyboard target obvious on a black panel.
@@ -364,9 +419,10 @@ Item {
       }
       SmallBtn {
         visible: !xfer.live
+        enabled: !root.isBusy(xfer.t.id)
         text: "Clear"
         Accessible.name: "Clear transfer " + root.transferTitle(xfer.t)
-        onClicked: root.dismiss(xfer.t.id)
+        onClicked: root.dismissRequested(xfer.t.id)
       }
     }
     Rectangle {
@@ -506,10 +562,6 @@ Item {
         visible: root.backendError !== ""
         text: root.backendError
       }
-      Note {
-        visible: root.backendError !== ""
-        text: "The panel talks to the omadrop command installed next to it. Nothing is shown until it answers."
-      }
       Btn {
         visible: root.backendError !== ""
         text: "Retry"
@@ -521,10 +573,21 @@ Item {
       visible: root.ready && root.status.error !== undefined && root.status.error !== ""
       text: root.ready && root.status.error ? root.status.error : ""
     }
+    Note {
+      visible: root.ready && root.startupWaiting && !root.startupFailed
+      text: "Starting nearby sharing. This can take up to a minute."
+    }
     Notice {
-      visible: root.ready && root.leaseError !== ""
-      label: "Not visible"
-      text: root.leaseError
+      visible: root.ready && root.startupFailed
+      label: "Not started"
+      text: root.startupMessage
+    }
+    Btn {
+      visible: root.ready && root.startupFailed && !root.leaseBusy
+      Layout.fillWidth: true
+      text: "Retry"
+      Accessible.name: "Retry starting nearby sharing"
+      onClicked: root.retryStartupRequested()
     }
     Notice {
       visible: root.actionError !== ""
@@ -590,20 +653,39 @@ Item {
           spacing: Style.space(8)
 
           // ---- transfers first, so progress is the first thing seen
+          // "Sending" appears only while an outbound transfer is live; finished
+          // ones are listed under "Recent", which appears alone when nothing is live.
           ColumnLayout {
             visible: root.outgoingList.length > 0
             Layout.fillWidth: true
             spacing: Style.space(8)
-            SectionRow {
-              title: "Sending"
-              meta: root.liveCount(root.outgoingList) > 0
-                    ? root.liveCount(root.outgoingList) + " active" : "finished"
+            ColumnLayout {
+              visible: root.outgoingLive.length > 0
+              Layout.fillWidth: true
+              spacing: Style.space(8)
+              SectionRow {
+                title: "Sending"
+                meta: root.outgoingLive.length + " active"
+              }
+              Repeater {
+                model: root.outgoingLive
+                TransferRow {
+                  required property var modelData
+                  t: modelData
+                }
+              }
             }
-            Repeater {
-              model: root.outgoingList
-              TransferRow {
-                required property var modelData
-                t: modelData
+            ColumnLayout {
+              visible: root.outgoingDone.length > 0
+              Layout.fillWidth: true
+              spacing: Style.space(8)
+              SectionRow { title: "Recent"; meta: "" }
+              Repeater {
+                model: root.outgoingDone
+                TransferRow {
+                  required property var modelData
+                  t: modelData
+                }
               }
             }
             PanelSeparator { Layout.fillWidth: true; foreground: root.foreground }
@@ -648,7 +730,7 @@ Item {
               }
 
               Repeater {
-                model: root.staged.slice(0, 5)
+                model: root.stageExpanded ? root.staged : root.staged.slice(0, 5)
                 RowLayout {
                   required property var modelData
                   Layout.fillWidth: true
@@ -668,10 +750,13 @@ Item {
                   }
                 }
               }
-              Meta {
+              SmallBtn {
                 visible: root.staged.length > 5
-                Layout.fillWidth: true
-                text: "+" + (root.staged.length - 5) + " more"
+                Layout.alignment: Qt.AlignHCenter
+                text: root.stageExpanded ? "Show fewer" : "Show all " + root.staged.length
+                Accessible.name: root.stageExpanded ? "Show fewer files to share"
+                  : "Show all " + root.staged.length + " files to share"
+                onClicked: root.stageExpanded = !root.stageExpanded
               }
 
               Meta {
@@ -724,8 +809,8 @@ Item {
           }
           Note {
             visible: root.peers.length === 0 && root.availableCount > 0
-            text: root.mode === "off"
-                  ? "Starting discovery…"
+            text: root.startupWaiting ? "Starting discovery…"
+                  : root.startupFailed ? "Nearby sharing did not start, so no devices can be seen."
                   : "No named devices found yet. Keep the other device's sharing screen open."
           }
           Note {
@@ -793,6 +878,7 @@ Item {
               required property var modelData
               required property int index
               readonly property bool working: root.isBusy(modelData.id)
+              readonly property bool expired: root.incomingExpired(modelData)
               Layout.fillWidth: true
               spacing: Style.space(4)
 
@@ -823,7 +909,7 @@ Item {
                 readonly property int secsLeft: root.incomingSecondsLeft(req.modelData)
                 visible: secsLeft >= 0
                 Layout.fillWidth: true
-                text: secsLeft > 0 ? "Expires in " + root.clock(secsLeft) : "Expired"
+                text: req.expired ? "Expired" : "Expires in " + root.clock(secsLeft)
               }
               Repeater {
                 model: (req.modelData.files || []).slice(1, 4)
@@ -851,10 +937,12 @@ Item {
               RowLayout {
                 Layout.fillWidth: true
                 spacing: Style.space(8)
+                // Accept needs a live request. Reject stays enabled on a lapsed
+                // one: it only clears the row and asks the backend to drop it.
                 Btn {
                   Layout.fillWidth: true
                   Layout.preferredWidth: 1
-                  enabled: !req.working
+                  enabled: !req.working && !req.expired
                   selected: true
                   text: "Accept"
                   Accessible.name: "Accept " + root.incomingTitle(req.modelData)
@@ -873,21 +961,39 @@ Item {
           }
 
           // ---- receiving progress
+          // Same rule as Send: "Receiving" only while an inbound transfer is live.
           ColumnLayout {
             visible: root.incomingList.length > 0
             Layout.fillWidth: true
             spacing: Style.space(8)
             PanelSeparator { Layout.fillWidth: true; foreground: root.foreground }
-            SectionRow {
-              title: "Receiving"
-              meta: root.liveCount(root.incomingList) > 0
-                    ? root.liveCount(root.incomingList) + " active" : "finished"
+            ColumnLayout {
+              visible: root.incomingLive.length > 0
+              Layout.fillWidth: true
+              spacing: Style.space(8)
+              SectionRow {
+                title: "Receiving"
+                meta: root.incomingLive.length + " active"
+              }
+              Repeater {
+                model: root.incomingLive
+                TransferRow {
+                  required property var modelData
+                  t: modelData
+                }
+              }
             }
-            Repeater {
-              model: root.incomingList
-              TransferRow {
-                required property var modelData
-                t: modelData
+            ColumnLayout {
+              visible: root.incomingDone.length > 0
+              Layout.fillWidth: true
+              spacing: Style.space(8)
+              SectionRow { title: "Recent"; meta: "" }
+              Repeater {
+                model: root.incomingDone
+                TransferRow {
+                  required property var modelData
+                  t: modelData
+                }
               }
             }
           }
@@ -898,9 +1004,15 @@ Item {
           // healthy one needs no row; only one that cannot show is named.
           SectionRow { title: "Visibility" }
           Note {
-            text: root.windowActive
-                  ? "Visible to nearby devices until the timer ends, even with this panel closed."
-                  : "Visible to nearby devices while this panel is open."
+            text: root.startupWaiting
+                  ? "Starting nearby sharing. Other devices cannot see this one yet."
+                  : root.startupFailed
+                    ? "Not visible: nearby sharing did not start."
+                    : root.windowActive
+                      ? "Visible to nearby devices until the timer ends, even with this panel closed."
+                      : root.mode === "menu"
+                        ? "Visible to nearby devices while this panel is open."
+                        : "Not visible yet."
           }
           Repeater {
             model: root.unavailable

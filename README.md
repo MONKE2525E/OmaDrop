@@ -1,136 +1,196 @@
-# omdrop-owl
+<p align="center"><img src="assets/omadrop.svg" width="80" height="80" alt="OmaDrop icon"></p>
 
-This fork also includes a native Omarchy **OmaDrop** panel for AirDrop, Quick
-Share and LocalSend. See [universal sharing](docs/universal-sharing.md) for
-installation and backend requirements. The original radio backend below
-continues to work independently.
+# OmaDrop
 
-https://github.com/user-attachments/assets/b195ce4c-e078-49be-bc13-44a72b6dc189
+OmaDrop is Monke's nearby file-sharing panel for [Omarchy](https://omarchy.org/).
+Send files from the bar, approve incoming transfers, and see nearby devices in
+one place. It supports LocalSend over the LAN, Quick Share through RQuickShare,
+and AirDrop through the OWL radio backend when the Wi-Fi hardware supports it.
 
-The radio half of [omdrop](https://github.com/brentkearney/omdrop-plugin) for
-machines without Apple's Broadcom Wi-Fi. AWDL runs in userspace through
-[OWL](https://github.com/jedbillyb/owl) on a monitor interface, and omdrop's own
-receiver and sender run over it unchanged. First target: the MediaTek MT7925
-(`mt7925e`), as in the Framework 13, where AirDrop works in both directions
-while Wi-Fi stays connected.
+This fork builds on [t4t5/omdrop-owl](https://github.com/t4t5/omdrop-owl).
+The OmaDrop panel, coordinator, and icon are maintained here. The radio package
+can also be used independently with the original omdrop plugin.
 
-It is a sibling of [omdrop-awdl](https://github.com/brentkearney/omdrop-awdl),
-the Broadcom radio package, and plugs into omdrop the same way: helpers in
-`/usr/lib/omdrop` that the omdrop CLI and panel call. The contract is described
-in omdrop's `docs/radio-backend.md`.
+## Features
 
-## How it works
+- One Send/Receive panel with file picking, drag and drop, clipboard staging,
+  incoming approval, cancellation, progress, and a configurable receive folder.
+- LocalSend HTTPS transfers with discovery on each eligible LAN interface and
+  a bounded subnet scan when multicast discovery misses a device.
+- Quick Share files and text through a pinned native RQuickShare bridge.
+- Optional AirDrop with upstream's shared and Intel exclusive radio modes,
+  plus the fork's experimental standalone and Wi-Fi Direct modes.
+- Visibility while the panel is open, or a saved window of up to ten minutes.
+  One unavailable backend leaves the others usable.
+- Finished, failed, and cancelled transfers clear after three hours, including
+  history restored after a restart. The Clear button removes them sooner.
+- Omarchy theme colors and fonts, with the original OmaDrop bar icon.
 
-The Wi-Fi station stays associated, and AWDL shares its channel:
+LocalSend requires the receiving device to run LocalSend. Quick Share and
+AirDrop have their own hardware and protocol requirements; a visible device
+name is not proof of the sender's identity.
 
-1. **AWDL runs on the access point's own channel**, which has to be 6, 44 or
-   149 (AWDL's channels). An iPhone spends a large share of its AWDL time slots
-   on those channels, so the radio never has to leave the AP.
-2. **A monitor interface carries the station's MAC**, and OWL runs on it with
-   `-S intersect`, advertising only the phone's slots on that channel.
-3. **The MT7925 sends injected frames from the station's MAC regardless**, and
-   the station interface ACKs the phone's unicast to that MAC, so no "active"
-   monitor interface is needed.
-4. OWL creates `awdl0`. omdrop's receiver binds to it, and omdrop-awdl's
-   `awdl-airdrop-adv.py --plain` announces `_airdrop._tcp` on it every few
-   seconds (`--plain`, because OWL adds the AWDL encapsulation itself).
+## Install on Omarchy
 
-## Layout
-
-```
-userspace/omdrop-discoverable   the radio helper (start, stop, status, peers, probe)
-userspace/owl-profiles          per-driver settings: the supported hardware
-patches/owl-*.patch             our changes to OWL, applied in name order
-tools/build-owl.sh              builds OWL at a pinned commit, with the patches
-tools/stage.sh                  assembles build/lib, laid out like /usr/lib/omdrop
-build/lib/                      (generated) ours, OWL, and omdrop-awdl's portable tools
-upstream/                       (generated) OWL and omdrop-awdl at pinned commits
-```
-
-From omdrop-awdl we reuse, unmodified, the tools that only talk to `awdl0` or
-BlueZ: `send-to-peer`, `airdrop-send.py`, `ble-airdrop-adv.py`,
-`awdl-airdrop-adv.py`, `awdl-mdns-respond.py` and the modules they import. They
-are fetched at a pinned commit by `tools/stage.sh`, never committed here.
-
-## Status
-
-- `omdrop-discoverable` implements the whole contract. Checked on the MT7925:
-  `start` returns in under 2 s with `awdl0` usable, announcements going out and
-  the phone listed by `peers`; a second `start` returns 5 and adjusts the
-  window; `stop` tears down in about 2 s; a window expires on its own.
-- omdrop's receiver, sender, announcer and BLE wake all work over it,
-  unmodified, in both directions.
-
-## Supported hardware
-
-What omdrop-owl does on each Wi-Fi driver comes from
-[`userspace/owl-profiles`](userspace/owl-profiles), one line per driver:
-
-| Driver | Card | Status |
-|---|---|---|
-| `mt7925e` | MediaTek MT7925 (Framework 13) | Tested: both directions, Wi-Fi stays connected |
-
-Any other card falls back to the table's `*` line, which only runs once you
-opt in with `echo 1 | sudo tee /etc/omdrop/allow-untested`.
-
-### Adding your card
-
-Cards that can inject frames from a monitor interface while connected to Wi-Fi
-are the likely candidates. Most mac80211 drivers can, but how they behave
-around it varies, which is what the profile records.
-
-1. Find your driver: `basename $(readlink /sys/class/net/<wifi>/device/driver)`.
-   Put your AP on channel 6, 44 or 149.
-2. Opt in (`/etc/omdrop/allow-untested`), and copy the `*` line to
-   `/etc/omdrop/owl-profiles` with your driver's name. That file is read before
-   the packaged table, so you can change settings without rebuilding.
-3. Try it: turn omdrop on, send a photo from an iPhone, send one back, and turn
-   it off. Then watch Wi-Fi for five minutes (`ping` your router): if it stops
-   receiving after omdrop turns off, keep `reconnect yes`.
-4. If something fails, try the other `mon_mac` setting. Report what you saw
-   either way.
-5. Open a pull request adding your line to `userspace/owl-profiles`, with
-   `status tested` and, in `notes`, the card, kernel version and what you
-   observed.
-
-Cards that can't inject while connected need an "exclusive" mode, which takes
-Wi-Fi away for the window. That mode doesn't exist yet; an issue with what you
-found is welcome.
-
-## Install
+Use a recent Omarchy release with the Quickshell shell/plugin system. Install
+the build and desktop helpers, then clone this fork:
 
 ```sh
-makepkg -si
+omarchy pkg add git rust protobuf dbus python uv openssl zenity \
+  wl-clipboard xdg-utils libnotify util-linux
+
+git clone https://github.com/MONKE2525E/OmaDrop.git
+cd OmaDrop
+tools/build-quickshare.sh
+tools/install-sharing.sh
 ```
 
-This builds OWL at the commit pinned in `pins`, with `patches/`, and installs it
-root-owned into `/usr/lib/omdrop` together with `omdrop-discoverable` and
-omdrop-awdl's portable tools, a polkit policy for the helper, and a
-NetworkManager rule keeping `awdl0` and `mon0` unmanaged. It conflicts with
-`brcmfmac-awdl-dkms`: one radio backend at a time.
+The coordinator needs Python 3.11 or newer. The installer creates a private
+Python environment, installs the plugin in
+`~/.config/omarchy/plugins/monke.omadrop`, adds its icon to the right side of
+the bar, and enables the user service `omadrop.service`. It backs up an existing
+plugin before replacing it. Updates use the same build/install commands.
+An already-running coordinator is left to restart at the next login so that
+installation does not interrupt a transfer.
 
-Then install omdrop itself (a version with radio-backend support) and turn it
-on from the bar. `/usr/lib/omdrop/omdrop-discoverable probe` says what, if
-anything, is in the way.
+The installer does not change firewall rules. Review the examples below if
+discovery or receiving fails. LocalSend and Quick Share do not need OWL or a
+Wi-Fi driver change.
 
-For development without installing, `tools/build-owl.sh` and `tools/stage.sh`
-assemble the same files in `build/lib`.
+### Optional AirDrop
 
-## Known issues
+The radio package requires `libev`, `libpcap`, `libnl`, a supported Wi-Fi card,
+and the pinned omdrop receiver. Install it from this checkout:
 
-- **Deleting a monitor interface while the station is associated wedges the
-  MT7925.** A bare monitor interface, added and deleted with nothing else
-  running, leaves the station "Connected" but receiving nothing, from seconds
-  to a few minutes later, until `mt7925e` is reloaded. That makes it an
-  mt76/firmware bug. omdrop's contract forbids the radio helper from reloading
-  the driver, so `stop` forces a reconnect right after deleting the interface
-  instead. In testing, that kept the station healthy for the four minutes
-  watched after every teardown.
-- **Sending is slower than receiving** (about 490 kB/s against 1.3 MB/s).
-  Injected frames leave at a fixed pace of about one every 2.5 ms, whatever
-  PHY rate OWL requests (`owl -R`, from `patches/owl-01-tx-rate.patch`) and
-  however many slots the phone offers.
-- **The AP has to be on channel 6, 44 or 149.** Otherwise `start` exits 3 and
-  says so. Taking the card off the AP for the duration of a window would lift
-  this, but isn't implemented.
-- **iPhones randomise their AWDL address**, so nothing here remembers a peer.
+```sh
+tools/install-airdrop.sh
+```
+
+The default `auto` choice uses profiles that select shared mode for MT7925
+and exclusive mode for supported
+Intel `iwlwifi` cards. Shared mode keeps Wi-Fi connected and requires the AP
+on channel 6, 44, or 149. Exclusive mode disconnects Wi-Fi for the visibility
+window and restores it afterwards; LocalSend and Quick Share then need another
+LAN connection, such as Ethernet.
+
+Explicit `shared` or `exclusive` arguments install that mode as a profile
+override; they refuse to replace an existing local profile. Check your card's
+supported mode before overriding automatic selection.
+
+`tools/install-airdrop.sh standalone` reserves an already-idle Wi-Fi card.
+`tools/install-airdrop.sh dualchan` installs the fork's experimental Wi-Fi Direct
+profile. These modes require the untested-hardware opt-in and should be tried
+only after reading [the backend notes](docs/universal-sharing.md). Preserve an
+existing `omdrop` installation and update it separately; the installer refuses
+to replace it. Hardware support and test reports are maintained by
+[upstream](https://github.com/t4t5/omdrop-owl#supported-hardware).
+
+## Use
+
+1. Open OmaDrop from the bar. Nearby devices appear as their protocols become
+   ready. Keep LocalSend open on the phone and connect both devices to the LAN.
+2. In Send, choose or drop files, or paste clipboard content. Select a device
+   and send. Staging content does not send it immediately.
+3. In Receive, inspect the sender and files before accepting. Compare the
+   Quick Share verification code on both devices. Rejected requests save nothing.
+4. Choose **Stay visible for 10 minutes** to receive with the panel closed.
+   **Stop early** ends that window. Closing the panel otherwise releases its
+   short visibility lease after active operations finish.
+5. Use **Clear** to remove finished history. Files already saved stay in the
+   receive folder. OmaDrop does not overwrite an existing filename.
+
+Useful commands return JSON:
+
+```sh
+omadrop status
+omadrop start --seconds 600
+omadrop stop
+omadrop directory --pick
+omadrop dismiss all
+systemctl --user status omadrop.service
+journalctl --user -u omadrop.service -n 50
+```
+
+Settings, TLS certificates, and transfer history live in `~/.config/omadrop`.
+Transient sockets, staged content, and logs
+use `$XDG_RUNTIME_DIR/omadrop`. The protocol and installation details are in
+[docs/universal-sharing.md](docs/universal-sharing.md).
+
+## Discovery and firewall troubleshooting
+
+LocalSend's default discovery group is **224.0.0.167:53317/UDP**. Registration
+and transfers use **53317/TCP**. OmaDrop joins and announces on eligible IPv4
+LAN interfaces, excluding common container, VPN, and AWDL interfaces. Announce
+bursts and subnet registration help when a phone starts late or the AP drops
+multicast. LocalSend v2 uses the `/api/localsend/v2` endpoints; minor protocol
+versions are compatible.
+
+If the phone is missing:
+
+- Keep LocalSend open and check that both devices use the same reachable LAN.
+  Guest Wi-Fi/client isolation can block discovery and transfers.
+- Check `omadrop status` for a LocalSend error. Another LocalSend process may
+  already own port 53317: inspect `ss -lntup | rg '53317|53318'`.
+- Check addresses with `ip -4 address show up`. Multiple Ethernet/Wi-Fi links
+  should be reachable from the phone; Docker or Tailscale routes can complicate
+  routing. A custom LocalSend port or multicast group must match on both ends.
+- Inspect the firewall with `sudo ufw status verbose` or `sudo nft list ruleset`.
+  A subnet scan cannot bypass blocked TCP, AP isolation, or phone battery limits.
+- Keep the Android app awake during testing. Disable a VPN temporarily if it
+  blocks access to the local network.
+
+For UFW, use the actual trusted subnet and interface, replacing the examples:
+
+```sh
+sudo ufw allow in on wlan0 from 192.168.1.0/24 to any port 53317 proto tcp
+sudo ufw allow in on wlan0 from 192.168.1.0/24 to 224.0.0.167 port 53317 proto udp
+# Quick Share receiving, if used:
+sudo ufw allow in on wlan0 from 192.168.1.0/24 to any port 53318 proto tcp
+# AirDrop receiving over the separate AWDL link, if used:
+sudo ufw allow in on awdl0 from fe80::/10 to any port 8771 proto tcp
+```
+
+Quick Share discovery also needs mDNS (5353/UDP). Check the existing mDNS rule
+before adding one. With nftables, allow the equivalent traffic in the managed
+input chain; do not add an unrelated parallel ruleset or disable the firewall.
+The examples above are manual choices, not actions performed by installation.
+
+If the header remains **Starting**, check the channel error and service log.
+Fix the reported missing dependency or port conflict, then retry from the panel.
+A stalled radio backend should not hold LocalSend startup hostage.
+
+## Development and checks
+
+```sh
+tools/build-quickshare.sh
+tools/build-owl.sh
+tools/stage.sh
+uv venv build/test-venv
+uv pip install --require-hashes --python build/test-venv/bin/python \
+  -r scripts/requirements.lock
+OMADROP_QUICKSHARE_BIN="$PWD/build/omadrop-quickshare" \
+  build/test-venv/bin/python -m unittest discover -s tests -v
+cargo fmt --manifest-path quickshare/Cargo.toml --check
+cargo clippy --locked --manifest-path quickshare/Cargo.toml -- -D warnings
+```
+
+The native UI harness in `plugins/monke.omadrop/test-harness` exercises the real
+panel with isolated fixtures. Protocol tests use local HTTPS/Quick Share peers;
+physical Android and Apple interoperability still needs device testing.
+`makepkg` builds the radio package; the panel is installed separately.
+
+## Credits and licenses
+
+- [t4t5/omdrop-owl](https://github.com/t4t5/omdrop-owl): radio backend, hardware
+  profiles, reliability improvements, and OWL patches.
+- [omdrop-plugin](https://github.com/brentkearney/omdrop-plugin) and
+  [omdrop-awdl](https://github.com/brentkearney/omdrop-awdl): receiver, sender,
+  and portable AirDrop helpers.
+- [OWL](https://github.com/jedbillyb/owl): userspace AWDL.
+- [LocalSend](https://localsend.org/) and its
+  [protocol](https://github.com/localsend/protocol): LAN discovery and transfers.
+- [RQuickShare](https://github.com/Martichou/RQuickShare): Quick Share engine.
+
+Bundled programs retain their own licenses: OWL GPL-3.0-or-later, omdrop-awdl
+GPL-2.0-only, radiotap ISC, hostapd BSD, and the Quick Share bridge GPL-3.0-or-later.
+See `quickshare/COPYING` and the radio package's installed license files.

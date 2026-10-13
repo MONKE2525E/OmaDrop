@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 16 16">
+  <!-- The OmaDropMark shape from plugins/monke.omadrop/ui/OmaDropMark.qml on its
+       16-unit grid: two facing corners (stroke 2) around one filled square. -->
+  <style>
+    .mark { fill: #1f2328; }
+    @media (prefers-color-scheme: dark) {
+      .mark { fill: #e6edf3; }
+    }
+  </style>
+  <g class="mark">
+    <rect x="2" y="2" width="8" height="2"/>
+    <rect x="2" y="2" width="2" height="8"/>
+    <rect x="12" y="6" width="2" height="8"/>
+    <rect x="6" y="12" width="8" height="2"/>
+    <rect x="6" y="6" width="4" height="4"/>
+  </g>
+</svg>
