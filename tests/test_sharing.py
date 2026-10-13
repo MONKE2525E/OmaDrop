@@ -1875,6 +1875,88 @@ class LocalSendTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.service.airdrop_owned)
         self.assertEqual(self.service.channels["airdrop"]["state"], "stopped")
 
+    async def send_upload_token_map(self, session, status=200):
+        sources = [Path(self.temp.name) / name for name in ("first.txt", "second.txt")]
+        for path, content in zip(sources, (b"first", b"second")):
+            path.write_bytes(content)
+        uploads = []
+
+        async def prepare(request):
+            offered = await request.json()
+            self.assertEqual(set(offered["files"]), {"0", "1"})
+            if status == 204:
+                return web.Response(status=204)
+            return web.json_response(session, status=status)
+
+        async def upload(request):
+            uploads.append((dict(request.query), await request.read()))
+            return web.Response()
+
+        app = web.Application()
+        app.router.add_post(omadrop.API + "/prepare-upload", prepare)
+        app.router.add_post(omadrop.API + "/upload", upload)
+        server = TestServer(app)
+        await server.start_server()
+        try:
+            peer = {"name": "Test receiver", "protocol": "localsend", "scheme": "http",
+                    "host": "127.0.0.1", "port": server.port}
+            key = f"token-map-{len(self.service.transfers)}"
+            await self.service.send_files(peer, [str(path) for path in sources], key)
+            return self.service.transfers[key], uploads
+        finally:
+            await server.close()
+
+    async def test_invalid_upload_token_map_fails_before_sending_any_bytes(self):
+        valid_tokens = {"0": "first-token", "1": "second-token"}
+        sessions = [None, [], {},
+            *({"sessionId": value, "files": valid_tokens} for value in (None, "", 1, [])),
+            *({"sessionId": "test-session", "files": value} for value in (
+                None, [], {}, {"0": "first-token", "00": "second-token"},
+                {"0": "first-token", "2": "second-token"},
+                {"-1": "first-token", "1": "second-token"},
+                {"0": None, "1": "second-token"},
+                {"0": "", "1": "second-token"},
+                {"0": 7, "1": "second-token"},
+            )),
+        ]
+        for session in sessions:
+            with self.subTest(session=session):
+                transfer, uploads = await self.send_upload_token_map(session)
+                self.assertEqual(transfer["state"], "failed")
+                self.assertEqual(transfer["error"], "Recipient returned an invalid LocalSend upload session")
+                self.assertEqual(transfer["bytes"], 0)
+                self.assertEqual(uploads, [])
+
+    async def test_partial_upload_token_map_reports_only_accepted_files(self):
+        transfer, uploads = await self.send_upload_token_map({
+            "sessionId": "test-session", "files": {"1": "second-token"},
+        })
+        self.assertEqual(transfer["state"], "complete")
+        self.assertEqual((transfer["files"], transfer["fileName"], transfer["name"]),
+                         (1, "second.txt", "second.txt"))
+        self.assertEqual((transfer["bytes"], transfer["total"]), (6, 6))
+        self.assertEqual(uploads, [({"sessionId": "test-session", "fileId": "1",
+                                    "token": "second-token"}, b"second")])
+
+    async def test_upload_token_map_http_204_completes_without_upload(self):
+        transfer, uploads = await self.send_upload_token_map(None, status=204)
+        self.assertEqual(transfer["state"], "complete")
+        self.assertEqual((transfer["files"], transfer["bytes"], transfer["total"]), (0, 0, 0))
+        self.assertEqual((transfer["fileName"], transfer["name"], transfer["error"]),
+                         ("No upload needed", "No upload needed", ""))
+        self.assertEqual(uploads, [])
+
+    async def test_reordered_upload_token_map_sends_each_offered_file_once(self):
+        transfer, uploads = await self.send_upload_token_map({
+            "sessionId": "test-session", "files": {"1": "second-token", "0": "first-token"},
+        })
+        self.assertEqual(transfer["state"], "complete")
+        self.assertEqual((transfer["files"], transfer["bytes"], transfer["total"]), (2, 11, 11))
+        self.assertCountEqual(uploads, [
+            ({"sessionId": "test-session", "fileId": "0", "token": "first-token"}, b"first"),
+            ({"sessionId": "test-session", "fileId": "1", "token": "second-token"}, b"second"),
+        ])
+
     async def test_real_outgoing_localsend_transfer(self):
         receiver = LocalOnly()
         with socket.socket() as sock:

@@ -2030,13 +2030,36 @@ class Coordinator:
                 json={"info": self.info(), "files": metadata},
                 ssl=self.remote_tls(peer),
             ) as response:
+                if response.status == 204:
+                    transfer.update(state="complete", bytes=0, total=0, files=0,
+                                    fileName="No upload needed", name="No upload needed")
+                    return
                 if response.status != 200:
                     raise (RecipientRejected if response.status == 403 else RuntimeError)(
                         f"Recipient refused transfer ({response.status})"
                     )
                 session = await response.json()
-            transfer["state"] = "transferring"
-            for file_id, token in session["files"].items():
+            if (
+                not isinstance(session, dict)
+                or not isinstance(session.get("sessionId"), str)
+                or not session["sessionId"]
+                or not isinstance(session.get("files"), dict)
+                or not session["files"]
+                or not session["files"].keys() <= metadata.keys()
+                or any(not isinstance(token, str) or not token for token in session["files"].values())
+            ):
+                raise RuntimeError("Recipient returned an invalid LocalSend upload session")
+            # LocalSend permits the recipient to accept only some offered files.
+            accepted_ids = [file_id for file_id in metadata if file_id in session["files"]]
+            transfer.update(
+                state="transferring",
+                files=len(accepted_ids),
+                fileName=metadata[accepted_ids[0]]["fileName"],
+                name=", ".join(metadata[file_id]["fileName"] for file_id in accepted_ids),
+                total=sum(metadata[file_id]["size"] for file_id in accepted_ids),
+            )
+            for file_id in accepted_ids:
+                token = session["files"][file_id]
                 path = Path(files[int(file_id)])
 
                 query = {
