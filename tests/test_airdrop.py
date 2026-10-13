@@ -1,6 +1,8 @@
 """AirDrop CLI compatibility: no peers is a valid advertising state."""
 import importlib.util
+import json
 import os
+import sys
 import tempfile
 import time
 import unittest
@@ -15,6 +17,57 @@ SPEC.loader.exec_module(omadrop)
 
 
 class AirDropTests(unittest.IsolatedAsyncioTestCase):
+    async def test_receiver_cli_remains_distinct_with_coordinator_first_on_path(self):
+        with tempfile.TemporaryDirectory(prefix="omadrop-cli-coexist-") as temp:
+            root = Path(temp)
+            coordinator_bin = root / "coordinator-bin"
+            receiver_bin = root / "receiver-bin"
+            coordinator_bin.mkdir()
+            receiver_bin.mkdir()
+            marker = root / "wrong-cli"
+            coordinator = coordinator_bin / "omadrop"
+            coordinator.write_text(
+                f"#!{sys.executable}\nfrom pathlib import Path\n"
+                f"Path({str(marker)!r}).touch()\nraise SystemExit('Wrong CLI invoked')\n"
+            )
+            coordinator.chmod(0o755)
+            state = root / "receiver-state.json"
+            receiver = receiver_bin / "omdrop"
+            receiver.write_text(
+                f"#!{sys.executable}\nimport json, sys\nfrom pathlib import Path\n"
+                f"path = Path({str(state)!r})\n"
+                "state = json.loads(path.read_text()) if path.exists() else {'receiving': False, 'visible': False}\n"
+                "command = sys.argv[1]\n"
+                "if command == 'status': print(json.dumps(state))\n"
+                "elif command == 'dir': state['directory'] = sys.argv[2]\n"
+                "elif command == 'on': state.update(receiving=True, visible=True)\n"
+                "elif command == 'off': state.update(receiving=False, visible=False)\n"
+                "elif command == 'peers': print(json.dumps([{'mac':'00:11:22:33:44:55','name':'Test Mac'}]))\n"
+                "else: raise SystemExit('Unexpected command')\n"
+                "path.write_text(json.dumps(state))\n"
+            )
+            receiver.chmod(0o755)
+            directory = str(root / "received")
+            with patch.dict(os.environ, {
+                "PATH": os.pathsep.join((str(coordinator_bin), str(receiver_bin))),
+                "OMADROP_CONFIG_DIR": str(root / "config"),
+            }):
+                service = omadrop.Coordinator()
+                service.settings["directory"] = directory
+                try:
+                    await service.start_airdrop()
+                    self.assertEqual(service.channels["airdrop"]["state"], "advertising")
+                    self.assertEqual(service.peers["airdrop:00:11:22:33:44:55"]["name"], "Test Mac")
+                    self.assertEqual(json.loads(state.read_text()), {
+                        "receiving": True, "visible": True, "directory": directory,
+                    })
+                finally:
+                    await service.stop()
+            self.assertEqual(json.loads(state.read_text()), {
+                "receiving": False, "visible": False, "directory": directory,
+            })
+            self.assertFalse(marker.exists())
+
     async def test_unnamed_peers_are_hidden_until_name_resolution(self):
         with tempfile.TemporaryDirectory(prefix="omadrop-peer-test-") as temp:
             with patch.dict(os.environ, {"OMADROP_CONFIG_DIR": temp}):

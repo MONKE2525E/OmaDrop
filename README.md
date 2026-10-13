@@ -66,6 +66,9 @@ and the pinned omdrop receiver. Install it from this checkout:
 tools/install-airdrop.sh
 ```
 
+The sharing coordinator uses the command `omadrop`. The AirDrop receiver
+installs the separate command `omdrop`, so the two installations can coexist.
+
 The default `auto` choice uses profiles that select shared mode for MT7925
 and exclusive mode for Intel `iwlwifi` cards. Intel exclusive mode requires
 an explicit opt-in because the same driver serves both verified and unverified

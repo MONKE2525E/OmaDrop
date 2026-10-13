@@ -11,7 +11,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class AirDropInstallModeTests(unittest.TestCase):
-    def run_install(self, mode=None, existing_profile=False):
+    def run_install(self, mode=None, existing_profile=False, coordinator=False):
         with tempfile.TemporaryDirectory(prefix="omadrop-install-test-") as temporary:
             base = Path(temporary)
             project = base / "project"
@@ -42,6 +42,10 @@ class AirDropInstallModeTests(unittest.TestCase):
             tools.mkdir()
             for name in ("bash", "dirname", "basename", "readlink", "awk", "mkdir", "mktemp", "cp", "install", "rm", "rg"):
                 (tools / name).symlink_to(shutil.which(name))
+            if coordinator:
+                coordinator_cli = tools / "omadrop"
+                coordinator_cli.write_text(f"#!{sys.executable}\nraise SystemExit('Wrong CLI invoked')\n")
+                coordinator_cli.chmod(0o755)
             mock = tools / "mock"
             mock.write_text(f"#!{sys.executable}\n" + r'''
 import os, pathlib, subprocess, sys
@@ -79,6 +83,13 @@ if name == 'git' and args[0] == 'clone':
     def test_default_uses_automatic_profile_without_override(self):
         result, profile, _ = self.run_install()
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIsNone(profile)
+
+    def test_existing_omadrop_coordinator_does_not_block_receiver_install(self):
+        result, profile, privileged = self.run_install(coordinator=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("[SUCCESS] AirDrop installed", result.stdout)
+        self.assertIn("pacman -U --noconfirm", privileged)
         self.assertIsNone(profile)
 
     def test_each_explicit_mode_is_written_and_firewall_is_untouched(self):
