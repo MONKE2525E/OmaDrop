@@ -2,14 +2,39 @@
 import os
 from pathlib import Path
 import subprocess
+import shlex
 import tempfile
 import unittest
 
 SOURCE = (Path(__file__).resolve().parents[1] / "userspace/omdrop-discoverable").read_text()
 FUNCTIONS = SOURCE[SOURCE.index("log() {"):SOURCE.rindex('\ncase "${1:-}"')]
+PROFILE_LOADER = SOURCE[SOURCE.index("load_profile() {"):SOURCE.index("untested_hint() {")]
+PROFILE_TABLE = Path(__file__).resolve().parents[1] / "userspace/owl-profiles"
 
 
 class RadioModeTests(unittest.TestCase):
+    def test_packaged_intel_profile_requires_opt_in_before_radio_changes(self):
+        extra = f"PROFILES={shlex.quote(str(PROFILE_TABLE))}\n" + PROFILE_LOADER + '''
+driver_of() { echo iwlwifi; }
+cmd_start 30
+'''
+        result, commands = self.run_case(extra=extra)
+        self.assertEqual(result.returncode, 4, result.stderr)
+        self.assertIn("allow-untested", result.stderr)
+        self.assertNotIn("exclusive_up", commands)
+        self.assertNotIn("nmcli device set", commands)
+        self.assertNotIn("ip link set", commands)
+
+    def test_opted_in_intel_profile_can_start_exclusive_mode(self):
+        extra = f"PROFILES={shlex.quote(str(PROFILE_TABLE))}\n" + PROFILE_LOADER + '''
+driver_of() { echo iwlwifi; }
+knob() { if [[ "$1" == allow-untested ]]; then echo 1; fi; }
+cmd_start 30
+'''
+        result, commands = self.run_case(extra=extra)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("exclusive_up wlan0", commands)
+
     def run_case(self, mode="shared", extra="cmd_start 30", *, freq="2437", foreign="", legacy=False, ipv6=True,
                  fail_type_restore=False, fail_ipv6_restore=False, fail_link_restore=False,
                  fail_mon_delete=False, fail_go_delete=False, fail_ibss_delete=False,

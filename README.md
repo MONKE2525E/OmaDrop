@@ -67,8 +67,12 @@ tools/install-airdrop.sh
 ```
 
 The default `auto` choice uses profiles that select shared mode for MT7925
-and exclusive mode for supported
-Intel `iwlwifi` cards. Shared mode keeps Wi-Fi connected and requires the AP
+and exclusive mode for Intel `iwlwifi` cards. Intel exclusive mode requires
+an explicit opt-in because the same driver serves both verified and unverified
+adapters. For a compatible card, choose `tools/install-airdrop.sh exclusive`
+when installing; an existing installation can opt in with
+`echo 1 | sudo tee /etc/omdrop/allow-untested` after checking upstream's hardware
+reports. Shared mode keeps Wi-Fi connected and requires the AP
 on channel 6, 44, or 149. Exclusive mode disconnects Wi-Fi for the visibility
 window and restores it afterwards; LocalSend and Quick Share then need another
 LAN connection, such as Ethernet.
