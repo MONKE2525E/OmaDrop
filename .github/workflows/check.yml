@@ -36,6 +36,7 @@ jobs:
           pacman -Syu --noconfirm --needed git cmake libev libpcap libnl
           rust protobuf uv openssl python-libarchive-c python-pillow
           python-zeroconf python-ifaddr python-dbus python-gobject shellcheck
+          ripgrep wl-clipboard
 
       - uses: actions/checkout@v4
 
@@ -59,9 +60,13 @@ jobs:
 
       - name: Run sharing and radio regressions
         run: |
-          export OMADROP_QUICKSHARE_BIN="$PWD/build/omadrop-quickshare"
-          export OMADROP_AIRDROP_RECEIVER_DIR="$PWD/build/test-receiver/bin"
-          build/test-venv/bin/python - <<'PY'
+          # The real receiver creates its identity only as an ordinary user.
+          useradd -m tester
+          chown -R tester "$GITHUB_WORKSPACE"
+          sudo -u tester env \
+            OMADROP_QUICKSHARE_BIN="$PWD/build/omadrop-quickshare" \
+            OMADROP_AIRDROP_RECEIVER_DIR="$PWD/build/test-receiver/bin" \
+            build/test-venv/bin/python - <<'PY'
           import unittest
           suite = unittest.defaultTestLoader.discover('tests')
           result = unittest.TextTestRunner(verbosity=2).run(suite)

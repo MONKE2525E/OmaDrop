@@ -200,12 +200,14 @@ class AirDropReceiverCancellationTests(unittest.IsolatedAsyncioTestCase):
             stderr=asyncio.subprocess.STDOUT,
             env=child_env,
         )
+        startup_output = []
         async with asyncio.timeout(15):
             while True:
                 line = await self.receiver.stdout.readline()
                 if not line:
-                    output = await self.receiver.stdout.read()
+                    output = b"".join(startup_output) + await self.receiver.stdout.read()
                     self.fail(f"AirDrop receiver exited during startup: {output.decode(errors='replace')}")
+                startup_output.append(line)
                 if b"serving " in line:
                     break
 
