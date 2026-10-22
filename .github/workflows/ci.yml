@@ -1,0 +1,61 @@
+# The workspace's checks (`just ci`: lints, tests, portability, spec
+# coverage, vectors, the README's hardware table), fuzzing for a fixed time
+# per target, and each radio mode on mac80211_hwsim.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+          targets: x86_64-pc-windows-msvc, aarch64-linux-android, riscv32imc-unknown-none-elf
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just
+      # The veth harness runs each AirDrop test in a user network namespace
+      # (unshare -rn), which Ubuntu's AppArmor refuses unprivileged users.
+      - name: Allow user namespaces
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      - run: just ci
+
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just,cargo-fuzz
+      # SEC-9: only ever against our own parsers, never a device.
+      - run: just fuzz 60
+
+  hwsim:
+    # ubuntu-24.04's Azure kernel (6.17) is built without Wi-Fi drivers, so
+    # it has no mac80211_hwsim; 22.04's (6.8) still has it.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just
+      # iw, hostapd for shared mode's simulated AP, and the kernel's
+      # mac80211_hwsim module.
+      - name: Install the radios
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq iw hostapd "linux-modules-extra-$(uname -r)"
+      - run: just hwsim

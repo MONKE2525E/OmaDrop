@@ -1,7 +1,9 @@
 #!/bin/sh
 set -e
 
-# A failed restoration must leave the installed helper available for retry.
-/usr/lib/omdrop/omdrop-discoverable stop
+# Gives Wi-Fi back if a session is up.
+if [ "$1" = remove ]; then
+  systemctl stop owlyd.service 2>/dev/null || true
+fi
 
 exit 0

@@ -1,0 +1,10 @@
+{
+  "name": "omadrop-triage",
+  "version": "0.1.0",
+  "description": "Diagnose AirDrop Wi-Fi compatibility with your own coding agent",
+  "license": "MIT",
+  "bin": { "omadrop-triage": "bin/omadrop-triage.cjs" },
+  "files": ["bin/omadrop-triage.cjs", "scripts/airdrop_triage.py", "scripts/airdrop-triage-playbook.md", "docs/omadrop.md"],
+  "engines": { "node": ">=18" },
+  "repository": { "type": "git", "url": "https://github.com/MONKE2525E/OmaDrop.git" }
+}

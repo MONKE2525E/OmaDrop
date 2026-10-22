@@ -23,6 +23,8 @@ for file in ui/OmaDropPanel.qml ui/OmaDropView.qml ui/OmaDropMark.qml manifest.j
   install -m644 "$root/plugins/monke.omadrop/$file" "$destination/$file"
 done
 install -m755 "$root/scripts/omadrop" "$root/scripts/omadrop.py" "$destination/bin/"
+install -m755 "$root/scripts/airdrop_triage.py" "$destination/bin/"
+install -m644 "$root/scripts/airdrop-triage-playbook.md" "$destination/bin/"
 install -m755 "$binary" "$destination/bin/omadrop-quickshare"
 install -Dm644 "$root/quickshare/COPYING" "$destination/licenses/RQuickShare-GPL-3.0"
 uv venv --allow-existing "$environment"

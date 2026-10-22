@@ -4,4 +4,8 @@ SELF=$(readlink -f -- "${BASH_SOURCE[0]}")
 HERE=$(cd -- "$(dirname -- "$SELF")" && pwd)
 PYTHON="${OMADROP_PYTHON:-${XDG_DATA_HOME:-$HOME/.local/share}/omadrop/venv/bin/python}"
 [[ -x "$PYTHON" ]] || PYTHON=python3
+if [[ "${1:-}" = triage ]]; then
+  shift
+  exec "$PYTHON" "$HERE/airdrop_triage.py" "$@"
+fi
 exec "$PYTHON" "$HERE/omadrop.py" "$@"

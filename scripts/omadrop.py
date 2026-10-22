@@ -2489,8 +2489,12 @@ async def cli(args):
 
 
 def main():
+    if sys.argv[1:2] == ["triage"]:
+        from airdrop_triage import main as triage_main
+        return triage_main(sys.argv[2:])
     parser = argparse.ArgumentParser(description="OmaDrop unified nearby sharing")
     sub = parser.add_subparsers(dest="command", required=True)
+    sub.add_parser("triage", help="Diagnose AirDrop Wi-Fi with Claude Code or Codex")
     for command in ("status", "start", "lease", "release", "stop", "daemon", "receive-request", "receive-progress", "pick", "stage-clipboard", "stage-text"):
         command_parser = sub.add_parser(command)
         command_parser.add_argument(

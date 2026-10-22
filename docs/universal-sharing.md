@@ -36,10 +36,10 @@ It does not replace the existing `omdrop` CLI or change Wi-Fi drivers.
 | --- | --- | --- |
 | LocalSend | LocalSend v2.2 HTTPS discovery, consent, upload and cancel | Same LAN, multicast UDP and TCP 53317 permitted; file transfers only |
 | Quick Share | Pinned RQuickShare library through a native JSON-lines bridge | Same LAN with mDNS and TCP 53318 permitted; Bluetooth wake when BlueZ permits it; files and shared text/URLs |
-| AirDrop | Pinned `omdrop` receiver and OWL AWDL radio backend | `tools/install-airdrop.sh`; shared radio mode is verified on MT7925 |
+| AirDrop | Pinned `omdrop` receiver and Owly radio backend | `tools/install-airdrop.sh`; shared radio mode is verified on MT7925 |
 
 The installers do not change firewall rules. Review the LAN/interface-scoped
-LocalSend, Quick Share, and AWDL examples in the root README before adding rules.
+LocalSend, Quick Share, and AWDL examples in [the installation guide](omadrop.md#discovery-and-firewall-troubleshooting) before adding rules.
 
 LocalSend uses a persistent self-signed certificate. Outbound HTTPS checks the
 certificate against the fingerprint announced by the peer. That is a
@@ -68,30 +68,11 @@ byte progress. When OmaDrop finds an AirDrop receiver already running, it does
 not take ownership or stop it, or change its receive folder. The common folder
 applies to AirDrop when OmaDrop starts that receiver itself.
 
-For an Ethernet desktop with an idle Wi-Fi card, `tools/install-airdrop.sh
-standalone` installs an experimental dedicated-radio profile. The card must
-already be disconnected. The helper reserves it from NetworkManager and
-restores its prior managed/up state on stop. Channel 6 is the default;
-`/etc/omdrop/standalone-channel` may select 6, 44, or 149. A connected Wi-Fi
-station is refused rather than disconnected. Reliable unicast needs hardware
-acknowledgments. On RTL8852BE, monitor receive, injection, peer synchronization,
-and IPv6 replies were observed, but active monitor mode was rejected by the
-driver and Mac HTTPS discovery stalled. This does not establish working AirDrop
-transfers on RTL8852BE. Shared mode on a compatible AP channel remains a separate
-test. Bluetooth wake and plain Ethernet mDNS replies run with the radio window.
-
-`tools/install-airdrop.sh dualchan` uses a Wi-Fi Direct group on an independent
-channel instead of borrowing the router's channel, following the
-[upstream P2P-GO mechanism](https://github.com/jedbillyb/mt7921-dual-channel).
-The packaged hostapd keeps
-the P2P-GO interface type; monitor injection uses that interface's MAC address
-to select its channel. No router or kernel changes are needed. The default is
-149; `/etc/omdrop/airdrop-channel` may select 6, 44, or 149. On RTL8852BE,
-regular Wi-Fi stayed connected on channel 161 while AWDL ran on 149. Mac native
-AirDrop discovery reached the receiver, and a protocol-client upload from the
-Mac produced matching file hashes. Native AirDrop photo and website sharing were confirmed during device testing;
-sustained large transfers remain unverified. This experimental mode requires the
-`allow-untested` opt-in and can increase Wi-Fi latency while active.
+OmaDrop now uses Owly 0.4.0. The former standalone and dualchan experiments
+have been removed with the legacy OWL backend. Existing `/etc/omdrop` profiles
+are preserved by installation but are not read by Owly. Use `omadrop triage` to
+check backend versions and migrate to the supported modes in `/etc/owly`.
+See [the AirDrop installation guide](omadrop.md#airdrop-with-owly).
 
 Devices remain separate protocol entries. Names are not reliable identity
 proof, and AirDrop uses changing addresses. The panel does not merge unrelated
