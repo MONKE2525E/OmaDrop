@@ -599,7 +599,13 @@ Panel {
   DropArea {
     id: barDrop
     anchors.fill: button
-    onEntered: function(drag) { drag.accepted = drag.hasUrls }
+    onEntered: function(drag) {
+      drag.accepted = drag.hasUrls
+      if (drag.accepted && !root.opened) {
+        root.open()
+        view.selectTab(0)
+      }
+    }
     onDropped: function(event) { event.accepted = root.dropFiles(event) }
   }
 
