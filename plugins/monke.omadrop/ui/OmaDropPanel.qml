@@ -444,7 +444,7 @@ Panel {
 
   Timer {
     interval: 6000
-    running: root.stageHint !== ""
+    running: root.opened && root.stageHint !== ""
     onTriggered: root.stageHint = ""
   }
 
@@ -457,6 +457,7 @@ Panel {
       if (f && f.path && !seen[f.path]) { seen[f.path] = true; list.push(f) }
     })
     staged = list.slice(0, 100)
+    if (list.length > 100) stageHint = "Only 100 items can be shared at once."
   }
 
   function removeStaged(path) {
@@ -465,6 +466,20 @@ Panel {
 
   function stageDropped(paths) {
     addStaged(paths.map(function(p) { return { path: p, name: baseName(p), size: 0, kind: "file" } }))
+  }
+
+  function dropFiles(event) {
+    var paths = []
+    for (var i = 0; i < event.urls.length; i++) {
+      var url = String(event.urls[i])
+      var match = /^file:\/\/(?:localhost)?(\/.*)$/i.exec(url)
+      if (!match) continue
+      try { paths.push(decodeURIComponent(match[1])) } catch (e) { continue }
+    }
+    if (paths.length === 0) return false
+    stageDropped(paths)
+    view.selectTab(0)
+    return true
   }
 
   function stageText(text) {
@@ -524,12 +539,13 @@ Panel {
   function sendTo(peerId) {
     if (sendingPeer !== "" || staged.length === 0) return
     sendingPeer = peerId
-    var paths = staged.map(function(f) { return f.path })
+    var batch = staged.slice()
+    var paths = batch.map(function(f) { return f.path })
     run(["send", "--peer", peerId, "--"].concat(paths), "", function(code, out, err) {
       root.sendingPeer = ""
       var parsed = root.parseJson(out)
       if (code === 0 && parsed && parsed.ok) {
-        root.staged = []
+        root.staged = root.staged.filter(function(f) { return batch.indexOf(f) < 0 })
         view.scrollToTop()
       }
     })
@@ -560,7 +576,6 @@ Panel {
 
   // -------------------------------------------------------------- lifecycle
   onOpenedChanged: if (opened) {
-    stageHint = ""
     refreshStatus()
     // A request waiting for a decision is what the person most needs to see.
     if (incomingCount > 0) view.selectTab(1)
@@ -577,8 +592,21 @@ Panel {
         tint: button.active && button.useActiveColor ? button.activeColor : button.foreground
       }
     }
-    active: root.incomingCount > 0
+    active: root.incomingCount > 0 || root.staged.length > 0 || barDrop.containsDrag
     onPressed: function(buttonCode) { root.toggle() }
+  }
+
+  DropArea {
+    id: barDrop
+    anchors.fill: button
+    onEntered: function(drag) {
+      drag.accepted = drag.hasUrls
+      if (drag.accepted && !root.opened) {
+        root.open()
+        view.selectTab(0)
+      }
+    }
+    onDropped: function(event) { event.accepted = root.dropFiles(event) }
   }
 
   KeyboardPanel {
@@ -594,6 +622,21 @@ Panel {
     margin: Math.max(Style.gapsOut, Style.space(8))
     contentWidth: panel.fittedContentWidth(Style.space(400))
     contentHeight: panel.fittedContentHeight(view.implicitHeight, root.maxContentHeight)
+
+    // KeyboardPanel maps a full-screen overlay above the bar when it opens.
+    // Keep the icon's drop target on that surface too, so releasing without
+    // moving into the card still stages the files. Reparent outside the card
+    // to the panel surface; the card can clip its children while animating.
+    DropArea {
+      parent: view.parent.parent.parent
+      x: panel.anchorScreenPos.x + (panel.barPos === "right" ? panel.screenW - panel.barW : 0)
+      y: panel.anchorScreenPos.y + (panel.barPos === "bottom" ? panel.screenH - panel.barH : 0)
+      width: panel.anchorW
+      height: panel.anchorH
+      enabled: root.opened
+      onEntered: function(drag) { drag.accepted = drag.hasUrls }
+      onDropped: function(event) { event.accepted = root.dropFiles(event) }
+    }
 
     OmaDropView {
       id: view
