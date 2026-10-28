@@ -623,6 +623,21 @@ Panel {
     contentWidth: panel.fittedContentWidth(Style.space(400))
     contentHeight: panel.fittedContentHeight(view.implicitHeight, root.maxContentHeight)
 
+    // KeyboardPanel maps a full-screen overlay above the bar when it opens.
+    // Keep the icon's drop target on that surface too, so releasing without
+    // moving into the card still stages the files. Reparent outside the card
+    // to the panel surface; the card can clip its children while animating.
+    DropArea {
+      parent: view.parent.parent.parent
+      x: panel.anchorScreenPos.x + (panel.barPos === "right" ? panel.screenW - panel.barW : 0)
+      y: panel.anchorScreenPos.y + (panel.barPos === "bottom" ? panel.screenH - panel.barH : 0)
+      width: panel.anchorW
+      height: panel.anchorH
+      enabled: root.opened
+      onEntered: function(drag) { drag.accepted = drag.hasUrls }
+      onDropped: function(event) { event.accepted = root.dropFiles(event) }
+    }
+
     OmaDropView {
       id: view
       anchors.fill: parent
