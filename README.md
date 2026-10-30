@@ -22,8 +22,8 @@ can also be used independently with the original omdrop plugin.
   plus the fork's experimental standalone and Wi-Fi Direct modes.
 - Visibility while the panel is open, or a saved window of up to ten minutes.
   One unavailable backend leaves the others usable.
-- Finished, failed, and cancelled transfers clear after three hours, including
-  history restored after a restart. The Clear button removes them sooner.
+- Finished transfers clear after three hours, except received items held for an
+  action. Held items remain available until you clear or discard them.
 - Omarchy theme colors and fonts, with the original OmaDrop bar icon.
 
 LocalSend requires the receiving device to run LocalSend. Quick Share and
@@ -100,6 +100,11 @@ to replace it. Hardware support and test reports are maintained by
    and send. Staging content does not send it immediately.
 3. In Receive, inspect the sender and files before accepting. Compare the
    Quick Share verification code on both devices. Rejected requests save nothing.
+   Once received, choose **Copy**, **Save**, or drag the **Drag** button into
+   another app. Copy uses the clipboard for text and images, or file URLs for
+   other files and multiple items. Save uses the configured receive folder.
+   Received items are held privately until you discard or clear them; save
+   them first if you want to keep them. File URLs stop working after clearing.
 4. Choose **Stay visible for 10 minutes** to receive with the panel closed.
    **Stop early** ends that window. Closing the panel otherwise releases its
    short visibility lease after active operations finish.
@@ -119,8 +124,9 @@ journalctl --user -u omadrop.service -n 50
 ```
 
 Settings, TLS certificates, and transfer history live in `~/.config/omadrop`.
-Transient sockets, staged content, and logs
-use `$XDG_RUNTIME_DIR/omadrop`. The protocol and installation details are in
+Transient sockets, outgoing staged content, and logs
+use `$XDG_RUNTIME_DIR/omadrop`. Received items waiting for an action are held
+in `$XDG_DATA_HOME/omadrop/received` (normally `~/.local/share/omadrop/received`). The protocol and installation details are in
 [docs/universal-sharing.md](docs/universal-sharing.md).
 
 ## Discovery and firewall troubleshooting

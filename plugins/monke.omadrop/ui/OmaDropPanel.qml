@@ -413,6 +413,14 @@ Panel {
   function accept(id) { run(["accept", id], id) }
   function reject(id) { run(["reject", id], id) }
   function cancel(id) { run(["cancel", id], id) }
+  property string copiedReceivedId: ""
+  Timer { id: copiedTimer; interval: 2500; onTriggered: root.copiedReceivedId = "" }
+  function copyReceived(id) {
+    run(["copy-received", id], id, function(code, out, err) {
+      if (root.failureText(code, out, err) === "") { root.copiedReceivedId = id; copiedTimer.restart() }
+    })
+  }
+  function saveReceived(id) { run(["save-received", id], id) }
   function dismiss(id) {
     // The row stays until the backend confirms it forgot the transfer.
     run(["dismiss", id], id, function(code) { if (code === 0) view.markCleared(id) })
@@ -654,6 +662,7 @@ Panel {
       sendingPeer: root.sendingPeer
       stageHint: root.stageHint
       pickingDirectory: root.pickingDirectory
+      copiedReceivedId: root.copiedReceivedId
       startupWaiting: root.startupWaiting
       startupFailed: root.startupFailed
       startupSeconds: root.startupSeconds
@@ -670,6 +679,8 @@ Panel {
       onRejectRequested: function(id) { root.reject(id) }
       onCancelRequested: function(id) { root.cancel(id) }
       onDismissRequested: function(id) { root.dismiss(id) }
+      onCopyReceivedRequested: function(id) { root.copyReceived(id) }
+      onSaveReceivedRequested: function(id) { root.saveReceived(id) }
       onKeepVisibleRequested: root.keepVisible()
       onStopVisibleRequested: root.stopVisible()
       onPickDirectoryRequested: root.pickDirectory()

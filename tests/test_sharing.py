@@ -501,7 +501,7 @@ class LocalSendTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.wait_for(publication, 3)
 
         self.assertEqual(self.service.transfers[key]["state"], "complete")
-        self.assertEqual((self.directory / source.name).read_bytes(), expected)
+        self.assertEqual(Path(self.service.transfers[key]["receivedPaths"][0]).read_bytes(), expected)
         self.assertFalse(source.exists())
         self.assertFalse(staging.exists())
         self.assertIsNone(self.service.quick_active)
@@ -545,7 +545,7 @@ class LocalSendTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.gather(watcher, return_exceptions=True)
 
         self.assertEqual(self.service.transfers[key]["state"], "complete")
-        self.assertEqual((self.directory / source.name).read_bytes(), content)
+        self.assertEqual(Path(self.service.transfers[key]["receivedPaths"][0]).read_bytes(), content)
         self.assertFalse(source.exists())
         self.assertNotIn(key, self.service.quick_publication_progress)
         self.assertIsNone(self.service.quick_active)
@@ -602,7 +602,7 @@ class LocalSendTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("without progress", self.service.transfers[key]["error"])
         self.assertEqual(destination.read_bytes(), b"keep existing destination")
         self.assertFalse((self.directory / "large (1).bin").exists())
-        self.assertFalse(list(self.directory.glob(".omadrop-*.part")))
+        self.assertFalse(list(Path(self.temp.name, "data").rglob(".omadrop-*.part")))
         self.assertFalse(source.exists())
         self.assertEqual(unrelated.read_bytes(), b"keep staged data")
         self.assertNotIn(key, self.service.quick_publication_progress)
@@ -855,7 +855,8 @@ class LocalSendTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.sleep(0.01)
             self.assertFalse((self.directory / "website.txt").exists())
             self.assertEqual(self.service.transfers[key]["state"], "complete")
-            opener.assert_awaited_once_with("xdg-open", "https://example.test/path", timeout=10)
+            opener.assert_not_awaited()
+            self.assertEqual(Path(self.service.transfers[key]["receivedPaths"][0]).read_text(), "https://example.test/path")
         self.service.quick_transfer({"id": "url", "rtype": "Inbound", "state": "Disconnected", "meta": metadata})
         self.assertEqual(self.service.transfers[key]["bytes"], len("https://example.test/path"))
 
@@ -894,7 +895,7 @@ class LocalSendTests(unittest.IsolatedAsyncioTestCase):
                 "state": "Finished", "meta": metadata,
             })
             await asyncio.wait_for(entered_copy.wait(), 2)
-            partials = list(self.directory.glob(".omadrop-*.part"))
+            partials = list(Path(self.temp.name, "data").rglob(".omadrop-*.part"))
             self.assertEqual(len(partials), 1)
             self.assertGreater(partials[0].stat().st_size, 0)
 
@@ -911,7 +912,7 @@ class LocalSendTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(self.service.quick_active)
             self.assertNotIn(key, self.service.quick_publications)
             self.assertFalse(source.exists())
-            self.assertFalse(list(self.directory.glob(".omadrop-*.part")))
+            self.assertFalse(list(Path(self.temp.name, "data").rglob(".omadrop-*.part")))
             self.assertFalse((self.directory / filename).exists())
             self.assertEqual(unrelated.read_bytes(), b"keep")
             quick_write.assert_awaited_with({"action": "CancelTransfer", "id": "cancel-mid-copy"})
@@ -1180,7 +1181,8 @@ class LocalSendTests(unittest.IsolatedAsyncioTestCase):
         response = await self.control.post("/", json=packet)
         self.assertEqual(response.status, 200)
         self.assertEqual(self.service.transfers[key]["bytes"], 1)
-        packet.update(bytes=4, state="complete")
+        Path(approval["directory"], "test.txt").write_bytes(b"test")
+        packet.update(bytes=4, state="complete", names=["test.txt"])
         await self.control.post("/", json=packet)
         self.assertEqual(self.service.transfers[key]["state"], "complete")
         response = await self.control.post("/", json=packet)
@@ -1299,9 +1301,10 @@ class LocalSendTests(unittest.IsolatedAsyncioTestCase):
                       "bytes": len(url) + 1, "state": "complete"}
             response = await self.control.post("/", json=packet)
             self.assertEqual(response.status, 200)
-            opener.assert_awaited_once_with("xdg-open", url, timeout=10)
+            opener.assert_not_awaited()
+            self.assertEqual(Path(self.service.transfers[key]["receivedPaths"][0]).read_text(), url + "\n")
             self.assertEqual((await self.control.post("/", json=packet)).status, 400)
-            self.assertEqual(opener.await_count, 1)
+            self.assertEqual(opener.await_count, 0)
         for url in ("file:///etc/passwd", "javascript:alert(1)", "https://example.test/\n"):
             response = await self.control.post("/", json={"command": "receive-request", "urls": [url], "files": []})
             self.assertEqual(response.status, 400)
@@ -1493,7 +1496,7 @@ class LocalSendTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="omadrop-test-")
         self.environment = patch.dict(
-            os.environ, {"OMADROP_CONFIG_DIR": self.temp.name + "/config"}
+            os.environ, {"OMADROP_CONFIG_DIR": self.temp.name + "/config", "XDG_DATA_HOME": self.temp.name + "/data"}
         )
         self.environment.start()
         with socket.socket() as sock:
@@ -1588,9 +1591,54 @@ class LocalSendTests(unittest.IsolatedAsyncioTestCase):
         response = await self.upload(session, b"hello")
         self.assertEqual(response.status, 200)
         self.assertEqual((self.directory / "test.txt").read_bytes(), b"keep")
+        self.assertFalse((self.directory / "test (1).txt").exists())
+        self.assertEqual(Path(self.service.transfers[request_id]["receivedPaths"][0]).read_bytes(), b"hello")
+        response = await self.control.post("/", json={"command": "save-received", "id": request_id})
+        self.assertEqual(response.status, 200)
         self.assertEqual((self.directory / "test (1).txt").read_bytes(), b"hello")
         self.assertEqual(self.service.transfers[request_id]["state"], "complete")
         self.assertFalse(list(self.directory.glob("*.part")))
+
+    async def test_stop_removes_only_incomplete_received_files(self):
+        local = omadrop.new_received_dir()
+        air = omadrop.new_received_dir()
+        completed = omadrop.new_received_dir()
+        for folder in (local, air, completed):
+            (folder / "item.txt").write_bytes(b"content")
+        self.service.sessions["local"] = {"directory": local}
+        self.service.airdrop_progress["air"] = {"directory": str(air)}
+        self.service.transfers["done"] = omadrop.Transfer(
+            id="done", direction="in", state="complete",
+            receivedPaths=[str(completed / "item.txt")],
+        )
+        await self.service.stop()
+        self.assertFalse(local.exists())
+        self.assertFalse(air.exists())
+        self.assertEqual((completed / "item.txt").read_bytes(), b"content")
+
+    async def test_received_copy_save_and_discard_survive_restart(self):
+        task, key = await self.prepare(content=b"hello")
+        session = await self.approve(task, key)
+        self.assertEqual((await self.upload(session, b"hello")).status, 200)
+        staged = Path(self.service.transfers[key]["receivedPaths"][0])
+        self.assertEqual(staged.read_bytes(), b"hello")
+        self.assertFalse((self.directory / "test.txt").exists())
+        with patch.object(omadrop, "copy_received", new=AsyncMock()) as copy:
+            response = await self.control.post("/", json={"command": "copy-received", "id": key})
+            self.assertEqual(response.status, 200)
+            copy.assert_awaited_once_with([staged])
+        restarted = LocalOnly()
+        restarted.expire_finished_transfers(time.time() + omadrop.TRANSFER_HISTORY_TTL + 1)
+        self.assertIn(key, restarted.transfers)
+        self.assertEqual(Path(restarted.transfers[key]["receivedPaths"][0]).read_bytes(), b"hello")
+        for _ in range(2):
+            response = await self.control.post("/", json={"command": "save-received", "id": key})
+            self.assertEqual(response.status, 200)
+        self.assertEqual((self.directory / "test.txt").read_bytes(), b"hello")
+        self.assertFalse((self.directory / "test (1).txt").exists())
+        self.assertEqual((await self.control.post("/", json={"command": "dismiss", "id": key})).status, 200)
+        self.assertFalse(staged.exists())
+        self.assertEqual((self.directory / "test.txt").read_bytes(), b"hello")
 
     async def test_progress_refreshes_upload_and_session_idle_timeouts(self):
         content = b"0123456789"
@@ -1625,10 +1673,10 @@ class LocalSendTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertGreater(time.monotonic() - started, 0.07)
         self.assertEqual(response.status, 200)
-        self.assertEqual((self.directory / "test.txt").read_bytes(), content)
+        self.assertEqual(Path(self.service.transfers[request_id]["receivedPaths"][0]).read_bytes(), content)
         self.assertEqual(self.service.transfers[request_id]["state"], "complete")
         self.assertNotIn(request_id, self.service.sessions)
-        self.assertFalse(list(self.directory.glob(".omadrop-*.part")))
+        self.assertFalse(list(Path(self.temp.name, "data").rglob(".omadrop-*.part")))
 
     async def test_stalled_upload_hits_idle_timeout_and_removes_partial_file(self):
         task, request_id = await self.prepare(content=b"hello")
@@ -1647,10 +1695,10 @@ class LocalSendTests(unittest.IsolatedAsyncioTestCase):
             try:
                 await asyncio.wait_for(first_chunk.wait(), 1)
                 for _ in range(100):
-                    if list(self.directory.glob(".omadrop-*.part")):
+                    if list(Path(self.temp.name, "data").rglob(".omadrop-*.part")):
                         break
                     await asyncio.sleep(0.01)
-                self.assertTrue(list(self.directory.glob(".omadrop-*.part")))
+                self.assertTrue(list(Path(self.temp.name, "data").rglob(".omadrop-*.part")))
                 await asyncio.sleep(0.06)
                 continue_upload.set()
                 response = await asyncio.wait_for(upload, 2)
@@ -1660,7 +1708,7 @@ class LocalSendTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status, 408)
         self.assertEqual(self.service.transfers[request_id]["state"], "failed")
         self.assertTrue(self.service.transfers[request_id]["error"])
-        self.assertFalse(list(self.directory.glob(".omadrop-*.part")))
+        self.assertFalse(list(Path(self.temp.name, "data").rglob(".omadrop-*.part")))
         self.assertFalse((self.directory / "test.txt").exists())
 
     async def test_decline(self):
@@ -1712,13 +1760,13 @@ class LocalSendTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(response.status, expected_status, kind)
             self.assertNotIn(request_id, self.service.sessions, kind)
             self.assertEqual(self.service.transfers[request_id]["state"], "failed", kind)
-            self.assertFalse(list(self.directory.glob(".omadrop-*.part")), kind)
+            self.assertFalse(list(Path(self.temp.name, "data").rglob(".omadrop-*.part")), kind)
 
         task, request_id = await self.prepare()
         session = await self.approve(task, request_id)
         response = await self.upload(session, b"hello")
         self.assertEqual(response.status, 200)
-        self.assertEqual((self.directory / "test.txt").read_bytes(), b"hello")
+        self.assertEqual(Path(self.service.transfers[request_id]["receivedPaths"][0]).read_bytes(), b"hello")
         self.assertEqual(unrelated.read_bytes(), b"keep")
 
     async def test_localsend_failure_cancels_concurrent_files_without_overwriting_failure(self):
@@ -1758,10 +1806,10 @@ class LocalSendTests(unittest.IsolatedAsyncioTestCase):
         try:
             await asyncio.wait_for(first_chunk.wait(), 2)
             for _ in range(100):
-                if list(self.directory.glob(".omadrop-*.part")):
+                if list(Path(self.temp.name, "data").rglob(".omadrop-*.part")):
                     break
                 await asyncio.sleep(0.01)
-            self.assertEqual(len(list(self.directory.glob(".omadrop-*.part"))), 1)
+            self.assertEqual(len(list(Path(self.temp.name, "data").rglob(".omadrop-*.part"))), 1)
             bad_response = await self.upload(session, b"bad!", file_id="bad")
             self.assertEqual(bad_response.status, 422)
             self.assertNotIn(request_id, self.service.sessions)
@@ -1777,7 +1825,7 @@ class LocalSendTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.service.transfers[request_id]["error"], first_error)
         self.assertFalse((self.directory / "bad.txt").exists())
         self.assertFalse((self.directory / "good.txt").exists())
-        self.assertFalse(list(self.directory.glob(".omadrop-*.part")))
+        self.assertFalse(list(Path(self.temp.name, "data").rglob(".omadrop-*.part")))
 
     async def test_path_traversal_and_invalid_size(self):
         for name, size in (
@@ -1830,7 +1878,7 @@ class LocalSendTests(unittest.IsolatedAsyncioTestCase):
         try:
             await asyncio.wait_for(first_chunk_sent.wait(), 2)
             for _ in range(100):
-                partials = list(self.directory.glob(".omadrop-*.part"))
+                partials = list(Path(self.temp.name, "data").rglob(".omadrop-*.part"))
                 if partials:
                     break
                 await asyncio.sleep(0.01)
@@ -1847,7 +1895,7 @@ class LocalSendTests(unittest.IsolatedAsyncioTestCase):
         response = await asyncio.wait_for(upload, 3)
         self.assertEqual(response.status, 403)
         self.assertEqual(self.service.transfers[request_id]["state"], "cancelled")
-        self.assertFalse(list(self.directory.glob(".omadrop-*.part")))
+        self.assertFalse(list(Path(self.temp.name, "data").rglob(".omadrop-*.part")))
         self.assertFalse((self.directory / "test.txt").exists())
 
     async def test_stop_with_pending_quickshare_consent(self):
@@ -1991,7 +2039,7 @@ class LocalSendTests(unittest.IsolatedAsyncioTestCase):
                 self.service.transfers["outgoing-test"]["state"], "complete"
             )
             self.assertEqual(
-                (Path(receiver.settings["directory"]) / "outgoing.txt").read_bytes(),
+                Path(next(iter(receiver.transfers.values()))["receivedPaths"][0]).read_bytes(),
                 source.read_bytes(),
             )
         finally:
@@ -2059,7 +2107,7 @@ class LocalSendTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.service.transfers["slow-outbound"]["state"], "complete")
         self.assertEqual(self.service.transfers["slow-outbound"]["bytes"], len(content))
         self.assertEqual(
-            (Path(receiver.settings["directory"]) / source.name).read_bytes(), content
+            Path(next(iter(receiver.transfers.values()))["receivedPaths"][0]).read_bytes(), content
         )
 
     async def test_outbound_localsend_stall_is_cancelled_by_progress_watchdog(self):
@@ -2112,11 +2160,11 @@ class LocalSendTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.wait_for(first_chunk.wait(), 2)
                 monitor = asyncio.create_task(monitor_progress())
                 for _ in range(100):
-                    if list(Path(receiver.settings["directory"]).glob(".omadrop-*.part")):
+                    if list(Path(self.temp.name, "data").rglob(".omadrop-*.part")):
                         break
                     await asyncio.sleep(0.01)
                 self.assertTrue(
-                    list(Path(receiver.settings["directory"]).glob(".omadrop-*.part"))
+                    list(Path(self.temp.name, "data").rglob(".omadrop-*.part"))
                 )
                 await asyncio.wait_for(monitor, 2)
                 continue_upload.set()
@@ -2124,7 +2172,7 @@ class LocalSendTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.sleep(0.05)
                 self.assertFalse(receiver.sessions)
                 self.assertFalse(
-                    list(Path(receiver.settings["directory"]).glob(".omadrop-*.part"))
+                    list(Path(self.temp.name, "data").rglob(".omadrop-*.part"))
                 )
             finally:
                 continue_upload.set()
@@ -2138,7 +2186,7 @@ class LocalSendTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("without progress", transfer["error"])
         self.assertFalse(receiver.sessions)
         self.assertFalse(
-            list(Path(receiver.settings["directory"]).glob(".omadrop-*.part"))
+            list(Path(self.temp.name, "data").rglob(".omadrop-*.part"))
         )
 
     async def test_localsend_watchdog_releases_all_abandoned_accepted_sessions(self):

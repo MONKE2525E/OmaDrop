@@ -6,7 +6,7 @@ dismiss surface takes every pointer event on the output and on the others. This
 copy keeps the component's layout and API and only removes that input, so a
 scripted run cannot be closed by someone else's clicks:
 
-  - the full-screen overlay gets an empty input region (`mask`),
+  - the overlay input region covers only the panel card,
   - its outside-click MouseArea is disabled,
   - the dismiss surfaces on the other outputs are not shown.
 
@@ -20,7 +20,7 @@ import sys
 EDITS = [
     # The overlay's input region: the whole screen in production.
     ("  mask: Region {\n    width: root.screenW\n    height: root.screenH\n  }",
-     "  mask: Region { width: 0; height: 0 }  // test: no pointer input"),
+     "  mask: Region { x: root.cardOrigin.x; y: root.cardOrigin.y; width: root.contentWidth; height: root.drawnHeight }  // test: card input only"),
     # The outside-click MouseArea that closes the popup in production.
     ("    enabled: root.open\n    acceptedButtons: Qt.AllButtons\n    hoverEnabled: true",
      "    enabled: false  // test: no outside-click dismissal\n"

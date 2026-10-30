@@ -47,9 +47,9 @@ ShellRoot {
     id: api
     pluginId: "monke.omadrop"
     moduleName: "monke.omadrop"
-    foreground: Color.foreground
-    barForeground: Color.foreground
-    background: Color.background
+    foreground: "#cacccc"
+    barForeground: "#cacccc"
+    background: "#101315"
     fontFamily: Style.font.family
     position: "top"
     barSize: 36
@@ -62,7 +62,7 @@ ShellRoot {
     screen: harness.scr
     anchors { top: true; left: true; right: true }
     implicitHeight: 36
-    color: Color.background
+    color: "#101315"
     exclusionMode: ExclusionMode.Ignore
     WlrLayershell.namespace: "omadrop-harness-bar"
     OmaDropPanel {
