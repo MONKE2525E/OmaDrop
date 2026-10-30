@@ -32,6 +32,7 @@ class QuickShareTests(unittest.IsolatedAsyncioTestCase):
             os.environ,
             {
                 "OMADROP_CONFIG_DIR": self.temp.name + "/config",
+                "XDG_DATA_HOME": self.temp.name + "/data",
                 "OMADROP_RUNTIME_DIR": self.temp.name + "/runtime",
                 "OMADROP_QUICKSHARE_PORT": "0",
             },
@@ -96,7 +97,7 @@ class QuickShareTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0.02)
         self.fail("No real Quick Share consent request arrived")
 
-    async def test_real_receive_requires_consent_and_publishes_bytes(self):
+    async def test_real_receive_requires_consent_and_holds_bytes_until_save(self):
         request_id = await self.send("sample.txt")
         pending = self.service.incoming[request_id]["public"]
         self.assertTrue(pending["pin"])
@@ -125,10 +126,15 @@ class QuickShareTests(unittest.IsolatedAsyncioTestCase):
                     break
                 await asyncio.sleep(0.02)
             self.assertEqual(self.service.transfers[request_id]["state"], "complete")
-            self.assertEqual(
-                (Path(self.service.settings["directory"]) / "sample.txt").read_bytes(),
-                b"Real Quick Share bytes",
+            destination = Path(self.service.settings["directory"]) / "sample.txt"
+            self.assertFalse(destination.exists())
+            held = Path(self.service.transfers[request_id]["receivedPaths"][0])
+            self.assertEqual(held.read_bytes(), b"Real Quick Share bytes")
+            response = await control.post(
+                "/", json={"command": "save-received", "id": request_id}
             )
+            self.assertEqual(response.status, 200)
+            self.assertEqual(destination.read_bytes(), b"Real Quick Share bytes")
         finally:
             await control.close()
 
