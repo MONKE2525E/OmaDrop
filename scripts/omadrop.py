@@ -187,6 +187,78 @@ def runtime_dir(create=True):
     return path
 
 
+def received_root():
+    root = Path(os.environ.get("XDG_DATA_HOME", str(Path.home() / ".local/share"))) / "omadrop" / "received"
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if root.is_symlink() or root.stat().st_uid != os.getuid():
+        raise RuntimeError("Unsafe received files directory")
+    root.chmod(0o700)
+    return root.resolve()
+
+
+def new_received_dir():
+    return Path(tempfile.mkdtemp(prefix="transfer-", dir=received_root()))
+
+
+def received_paths(transfer):
+    values = transfer.get("receivedPaths") or []
+    root = received_root().resolve()
+    paths = [Path(value) for value in values]
+    if not paths or any(p.parent.parent != root or not p.parent.name.startswith("transfer-")
+                        or p.parent.is_symlink() or p.is_symlink() or not p.is_file() for p in paths):
+        raise ValueError("Received files are no longer available")
+    return paths
+
+
+def discard_received(transfer):
+    try:
+        paths = received_paths(transfer)
+        folders = {p.parent for p in paths}
+        for folder in folders:
+            shutil.rmtree(folder)
+    except (OSError, ValueError, RuntimeError):
+        pass
+
+
+def save_received(paths, folder):
+    folder.mkdir(parents=True, exist_ok=True)
+    saved = []
+    for source in paths:
+        fd, temp = tempfile.mkstemp(prefix=".omadrop-", suffix=".part", dir=folder)
+        try:
+            with os.fdopen(fd, "wb") as output, source.open("rb") as input_file:
+                shutil.copyfileobj(input_file, output)
+            for suffix in range(1000):
+                name = source.name if suffix == 0 else f"{source.stem} ({suffix}){source.suffix}"
+                try:
+                    os.link(temp, folder / name)
+                    saved.append(str(folder / name))
+                    break
+                except FileExistsError:
+                    continue
+            else:
+                raise RuntimeError("Too many duplicate file names")
+        finally:
+            os.unlink(temp)
+    return saved
+
+
+async def copy_received(paths):
+    if not shutil.which("wl-copy"):
+        raise RuntimeError("Copying requires wl-clipboard")
+    mime = mimetypes.guess_type(paths[0].name)[0] if len(paths) == 1 else None
+    if mime and (mime.startswith("image/") or mime.startswith("text/")):
+        with paths[0].open("rb") as source:
+            process = await asyncio.create_subprocess_exec("wl-copy", "--type", mime, stdin=source, stderr=asyncio.subprocess.DEVNULL)
+            await process.wait()
+    else:
+        content = ("\r\n".join(path.as_uri() for path in paths) + "\r\n").encode()
+        process = await asyncio.create_subprocess_exec("wl-copy", "--type", "text/uri-list", stdin=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+        await process.communicate(content)
+    if process.returncode:
+        raise RuntimeError("Could not copy received files")
+
+
 def config_dir():
     return Path(
         os.environ.get(
@@ -482,6 +554,7 @@ class Coordinator:
         self.quick_process_staging = {}
         self.quick_exit_watchers = {}
         self.airdrop_progress = {}
+        self.received_locks = {}
         self.airdrop_sends = set()
         self.airdrop_owned = False
         self.airdrop_names = None
@@ -511,7 +584,7 @@ class Coordinator:
                 if not isinstance(row, dict) or row.get("state") not in FINISHED_STATES or not isinstance(row.get("id"), str):
                     continue
                 completed = row.get("completedAt", row.get("updated", 0))
-                if type(completed) not in (int, float) or not math.isfinite(completed) or completed <= time.time() - TRANSFER_HISTORY_TTL:
+                if type(completed) not in (int, float) or not math.isfinite(completed) or (not row.get("receivedPaths") and completed <= time.time() - TRANSFER_HISTORY_TTL):
                     continue
                 row["completedAt"] = min(completed, time.time())
                 self.transfers[row["id"]] = Transfer(row)
@@ -524,7 +597,7 @@ class Coordinator:
     def save_history(self):
         if self.loading_history:
             return
-        fields = {"id", "name", "fileName", "files", "peer", "protocol", "direction", "bytes", "total", "state", "error", "updated", "completedAt"}
+        fields = {"id", "name", "fileName", "files", "peer", "protocol", "direction", "bytes", "total", "state", "error", "updated", "completedAt", "receivedPaths", "savedPaths"}
         rows = [{key: value for key, value in row.items() if key in fields}
                 for row in self.transfers.values() if row.get("state") in FINISHED_STATES]
         try:
@@ -541,6 +614,7 @@ class Coordinator:
         now = time.time() if now is None else now
         expired = [key for key, row in self.transfers.items()
                    if row.get("state") in FINISHED_STATES
+                   and not row.get("receivedPaths")
                    and row.get("completedAt", row.get("updated", 0)) <= now - TRANSFER_HISTORY_TTL]
         for key in expired:
             dict.pop(self.transfers, key)
@@ -644,7 +718,8 @@ class Coordinator:
             "protocols": list(self.channels.values()),
             "peers": peers,
             "incoming": [v["public"] for v in self.incoming.values()],
-            "transfers": list(self.transfers.values())[-50:],
+            "transfers": [row for i, row in enumerate(self.transfers.values())
+                          if row.get("receivedPaths") or i >= max(0, len(self.transfers) - 50)],
             "error": self.error,
         }
 
@@ -766,6 +841,7 @@ class Coordinator:
         self.quick_exit_watchers.clear()
         self.quick_publication_progress.clear()
         self.airdrop_sends.clear()
+        airdrop_holding = [grant["directory"] for grant in self.airdrop_progress.values()]
         self.airdrop_progress.clear()
         if self.udp:
             self.udp.close()
@@ -789,8 +865,12 @@ class Coordinator:
                 self.airdrop_owned = False
                 if self.error.startswith("Could not stop AirDrop:"):
                     self.error = ""
+        for directory in airdrop_holding:
+            shutil.rmtree(directory, ignore_errors=True)
         self.peers.clear()
         self.incoming.clear()
+        for session in self.sessions.values():
+            shutil.rmtree(session["directory"], ignore_errors=True)
         self.sessions.clear()
         for transfer in self.transfers.values():
             if transfer["state"] in ACTIVE_STATES:
@@ -1124,9 +1204,7 @@ class Coordinator:
                     "state": "pending",
                 }
             total = sum(f["size"] for f in items.values())
-            folder = Path(self.settings["directory"])
-            folder.mkdir(parents=True, exist_ok=True)
-            if total > shutil.disk_usage(folder).free * 0.8:
+            if total > shutil.disk_usage(received_root()).free * 0.8:
                 raise ValueError("Not enough free disk space")
         except (ValueError, KeyError, TypeError):
             raise web.HTTPBadRequest()
@@ -1154,6 +1232,7 @@ class Coordinator:
             self.incoming.pop(request_id, None)
         if not accepted or not self.running:
             raise web.HTTPForbidden(text="Rejected")
+        folder = new_received_dir()
         self.sessions[request_id] = {
             "files": items,
             "host": request.remote,
@@ -1246,9 +1325,10 @@ class Coordinator:
                     continue
             else:
                 raise web.HTTPConflict(text="Too many duplicate names")
+            entry["path"] = str(folder / name)
             entry["state"] = "complete"
             if all(f["state"] == "complete" for f in session["files"].values()):
-                transfer["state"] = "complete"
+                transfer.update(receivedPaths=[f["path"] for f in session["files"].values()], state="complete")
                 self.sessions.pop(session_id, None)
             return web.Response()
         except BaseException as error:
@@ -1260,6 +1340,7 @@ class Coordinator:
                     transfer.update(state="failed", error=str(error)[:200])
             elif transfer["state"] in ACTIVE_STATES:
                 transfer.update(state="cancelled", error=str(error)[:200])
+            shutil.rmtree(folder, ignore_errors=True)
             raise
         finally:
             temporary.unlink(missing_ok=True)
@@ -1272,6 +1353,7 @@ class Coordinator:
         session["cancelled"] = True
         self.transfers[session_id]["state"] = "cancelled"
         self.sessions.pop(session_id, None)
+        shutil.rmtree(session["directory"], ignore_errors=True)
         return web.Response()
 
     def expire_localsend_sessions(self, now=None):
@@ -1281,6 +1363,7 @@ class Coordinator:
                 continue
             session["cancelled"] = True
             self.sessions.pop(key, None)
+            shutil.rmtree(session["directory"], ignore_errors=True)
             transfer = self.transfers.get(key)
             if transfer and transfer["state"] in ACTIVE_STATES:
                 transfer.update(state="failed", error="Transfer timed out")
@@ -1292,7 +1375,6 @@ class Coordinator:
             if self.quick.returncode is None:
                 return
             self.quick_process_exited(self.quick)
-        Path(self.settings["directory"]).mkdir(parents=True, exist_ok=True)
         # The engine writes only into private staging. Validate remote names
         # before consent, then publish completed files without overwriting.
         self.quick_staging = Path(
@@ -1526,7 +1608,7 @@ class Coordinator:
                     raise ValueError("Duplicate file names in request")
                 if (
                     metadata.get("total_bytes", 0)
-                    > shutil.disk_usage(self.settings["directory"]).free * 0.8
+                    > shutil.disk_usage(received_root()).free * 0.8
                 ):
                     raise ValueError("Not enough free disk space")
                 self.quick_files[key] = list(files)
@@ -1635,18 +1717,12 @@ class Coordinator:
         try:
             if transfer.get("state") == "cancelled":
                 raise asyncio.CancelledError
-            folder = Path(self.settings["directory"])
+            folder = new_received_dir()
+            received = []
             if key in self.quick_text:
                 payload = self.quick_text.pop(key)
                 if not isinstance(payload, str) or not payload or len(payload.encode()) > 1024 * 1024:
                     raise ValueError("Shared text is empty or exceeds the 1 MB limit")
-                if transfer["fileName"] == "website.txt":
-                    await open_shared_urls([payload])
-                    if transfer.get("state") == "cancelled":
-                        raise asyncio.CancelledError
-                    transfer.update(state="complete", bytes=len(payload.encode()), total=len(payload.encode()))
-                    self.quick_files.pop(key, None)
-                    return
                 filename = transfer["fileName"]
                 path = staging / filename
                 with path.open("xb") as output:
@@ -1688,13 +1764,14 @@ class Coordinator:
                             continue
                     else:
                         raise RuntimeError("Too many duplicate file names")
+                    received.append(str(folder / name))
                     source_path.unlink()
                 finally:
                     temporary.unlink(missing_ok=True)
             if transfer.get("state") == "cancelled":
                 raise asyncio.CancelledError
             self.quick_files.pop(key, None)
-            transfer["state"] = "complete"
+            transfer.update(receivedPaths=received, state="complete")
         except asyncio.CancelledError:
             if transfer.get("state") in ACTIVE_STATES:
                 transfer["state"] = "cancelled"
@@ -1707,6 +1784,8 @@ class Coordinator:
                 transfer.update(state="failed", error=str(error)[:240])
                 self.cleanup_quick_staging(key)
         finally:
+            if transfer.get("state") != "complete" and "folder" in locals():
+                shutil.rmtree(folder, ignore_errors=True)
             transfer.pop("publishing", None)
             if self.quick_active == key:
                 self.quick_active = None
@@ -1815,6 +1894,7 @@ class Coordinator:
             for key, grant in list(self.airdrop_progress.items()):
                 if grant["expires"] <= time.monotonic():
                     self.airdrop_progress.pop(key, None)
+                    shutil.rmtree(grant["directory"], ignore_errors=True)
                     transfer = self.transfers.get(key)
                     if transfer and transfer["state"] in ACTIVE_STATES:
                         transfer.update(state="failed", error="AirDrop upload did not start or finish in time")
@@ -2155,12 +2235,13 @@ class Coordinator:
                 if accepted is not True or not self.running:
                     return web.json_response({"accepted": False})
                 token = secrets.token_urlsafe(32)
-                self.airdrop_progress[key] = {"token": token, "expires": time.monotonic() + 60, "urls": urls}
+                folder = new_received_dir()
+                self.airdrop_progress[key] = {"token": token, "expires": time.monotonic() + 60, "urls": urls, "directory": str(folder)}
                 self.transfers[key] = Transfer(id=key, name=", ".join(row["name"] for row in files),
                     fileName=files[0]["name"], files=len(files), peer=str(packet.get("peer") or "Apple device")[:100],
                     protocol="airdrop", direction="in", bytes=0, total=sum(row["size"] for row in files),
                     state="waiting", error="")
-                return web.json_response({"accepted": True, "transferId": key, "token": token})
+                return web.json_response({"accepted": True, "transferId": key, "token": token, "directory": str(folder)})
             elif command == "receive-progress":
                 key = packet["id"]
                 transfer = self.transfers.get(key)
@@ -2179,15 +2260,20 @@ class Coordinator:
                 # The AirDrop receiver reports authenticated request-body
                 # activity before archive extraction can produce byte progress.
                 self.transfer_watch[key] = ((state, count), time.monotonic())
-                if state == "complete" and grant.get("urls"):
-                    # Consume before launching: a repeated progress packet cannot reopen tabs.
-                    urls = grant.pop("urls")
-                    try:
-                        await open_shared_urls(urls)
-                    except RuntimeError as error:
-                        transfer.update(state="failed", error=str(error))
-                        self.airdrop_progress.pop(key, None)
-                        raise
+                if state == "complete":
+                    folder = Path(grant["directory"])
+                    if grant.get("urls"):
+                        names = ["Website link.txt" if len(grant["urls"]) == 1 else f"Website link {i + 1}.txt" for i in range(len(grant["urls"]))]
+                        for name, url in zip(names, grant["urls"]):
+                            (folder / name).write_text(url + "\n")
+                    else:
+                        names = packet.get("names")
+                        if not isinstance(names, list) or len(names) != transfer["files"]:
+                            raise ValueError("AirDrop did not report received files")
+                    transfer["receivedPaths"] = [str(folder / safe_name(name)) for name in names]
+                    received_paths(transfer)
+                elif state == "failed":
+                    shutil.rmtree(grant["directory"], ignore_errors=True)
                 transfer.update(state=state, bytes=count, error=str(packet.get("error") or "")[:240])
                 grant["expires"] = time.monotonic() + 600
                 if state in ("complete", "failed"):
@@ -2302,11 +2388,14 @@ class Coordinator:
                     session = self.sessions[key]
                     session["cancelled"] = True
                     self.sessions.pop(key)
+                    shutil.rmtree(session["directory"], ignore_errors=True)
                 elif (
                     key.startswith("airdrop:")
                     and self.transfers.get(key, {}).get("direction") == "in"
                 ):
-                    self.airdrop_progress.pop(key, None)
+                    grant = self.airdrop_progress.pop(key, None)
+                    if grant:
+                        shutil.rmtree(grant["directory"], ignore_errors=True)
                 else:
                     tasks = [task for task in self.tasks if task.get_name() == key]
                     for task in tasks:
@@ -2334,13 +2423,28 @@ class Coordinator:
                 self.spawn(self.send_files(dict(peer), files, key)).set_name(key)
                 return web.json_response({**self.snapshot(), "ok": True, "transferId": key,
                                           "transfer": dict(self.transfers[key])})
+            elif command in ("copy-received", "save-received"):
+                transfer = self.transfers.get(packet["id"])
+                if not transfer or transfer.get("direction") != "in" or transfer.get("state") != "complete":
+                    raise ValueError("Received transfer is no longer available")
+                async with self.received_locks.setdefault(packet["id"], asyncio.Lock()):
+                    if self.transfers.get(packet["id"]) is not transfer:
+                        raise ValueError("Received transfer is no longer available")
+                    paths = received_paths(transfer)
+                    if command == "copy-received":
+                        await copy_received(paths)
+                    elif not transfer.get("savedPaths"):
+                        transfer["savedPaths"] = await asyncio.to_thread(save_received, paths, Path(self.settings["directory"]))
             elif command == "dismiss":
                 key = packet["id"]
                 keys = list(self.transfers) if key == "all" else [key]
                 for key in keys:
                     transfer = self.transfers.get(key)
                     if transfer and transfer["state"] not in ACTIVE_STATES:
-                        self.transfers.pop(key)
+                        async with self.received_locks.setdefault(key, asyncio.Lock()):
+                            if self.transfers.get(key) is transfer:
+                                discard_received(transfer)
+                                self.transfers.pop(key)
             elif command == "directory":
                 folder = Path(packet["path"]).expanduser().resolve()
                 if not folder.is_dir() or not os.access(folder, os.W_OK):
@@ -2442,7 +2546,7 @@ async def cli(args):
         packet["durationSeconds"] = args.seconds
     if args.command in ("lease", "release") and args.lease_id is not None:
         packet["leaseId"] = args.lease_id
-    if args.command in ("accept", "reject", "cancel", "dismiss"):
+    if args.command in ("accept", "reject", "cancel", "dismiss", "copy-received", "save-received"):
         packet["id"] = args.id
     if args.command == "send":
         files = pick_files() if args.pick else args.files
@@ -2504,7 +2608,7 @@ def main():
                 dest="lease_id",
                 help="Scope a menu lease to this caller; without it, use the shared legacy lease",
             )
-    for command in ("accept", "reject", "cancel", "dismiss"):
+    for command in ("accept", "reject", "cancel", "dismiss", "copy-received", "save-received"):
         sub.add_parser(command).add_argument("id")
     send = sub.add_parser("send")
     send.add_argument("--peer", required=True)

@@ -31,7 +31,7 @@ PATCHED_RECEIVER = RECEIVER_SCRIPT.is_file() and all(
     marker in RECEIVER_SCRIPT.read_text(errors="replace")
     for marker in (
         "on_chunk=lambda: airdrop_consent.report(consent)",
-        "airdrop_consent.report(consent, 'complete')",
+        "airdrop_consent.report(consent, 'complete', names=written)",
     )
 )
 LIBARCHIVE_SITE = None
@@ -139,6 +139,7 @@ class AirDropReceiverCancellationTests(unittest.IsolatedAsyncioTestCase):
         bridge.parent.mkdir(parents=True)
         self.progress_log = self.root / "progress.log"
         self.cancel_marker = self.root / "cancelled"
+        self.allow_marker = self.root / "allow-complete"
         control_url = str(self.control.server.make_url("/"))
         bridge.write_text(
             f"#!{sys.executable}\n"
@@ -148,6 +149,7 @@ class AirDropReceiverCancellationTests(unittest.IsolatedAsyncioTestCase):
             f"CONTROL_URL = {control_url!r}\n"
             f"PROGRESS_LOG = {str(self.progress_log)!r}\n"
             f"CANCEL_MARKER = {str(self.cancel_marker)!r}\n"
+            f"ALLOW_MARKER = {str(self.allow_marker)!r}\n"
             "command = sys.argv[1]\n"
             "packet = json.load(sys.stdin)\n"
             "packet['command'] = command\n"
@@ -165,7 +167,7 @@ class AirDropReceiverCancellationTests(unittest.IsolatedAsyncioTestCase):
             "    if packet.get('state') == 'transferring' and packet.get('bytes') == 0:\n"
             "        if pathlib.Path(PROGRESS_LOG).read_text().count('\\n') <= 2:\n"
             "            time.sleep(0.35)\n"
-            "    if packet.get('state') == 'transferring' and packet.get('bytes', 0) > 0:\n"
+            "    if packet.get('state') == 'transferring' and packet.get('bytes', 0) > 0 and not pathlib.Path(ALLOW_MARKER).exists():\n"
             "        post({'command': 'cancel', 'id': packet['id']})\n"
             "        pathlib.Path(CANCEL_MARKER).touch()\n"
             "status, body = post(packet)\n"
@@ -299,6 +301,82 @@ class AirDropReceiverCancellationTests(unittest.IsolatedAsyncioTestCase):
         progress = self.progress_log.read_text().splitlines()
         self.assertGreaterEqual(progress.count("transferring 0"), 2)
         self.assertIn("transferring 8", progress)
+
+
+    async def test_https_upload_holds_received_file_until_save(self):
+        self.allow_marker.touch()
+        old_destination = self.root / "old-destination"
+        self.destination.rename(old_destination)
+        transfer_id = "test-transfer-123"
+        body = _archive("new.txt", b"new data")
+        ask = plistlib.dumps(
+            {
+                "TransferID": transfer_id,
+                "SenderComputerName": "Test sender",
+                "Files": [{"FileName": "new.txt", "FileSize": len(b"new data")}],
+            },
+            fmt=plistlib.FMT_BINARY,
+        )
+
+        def send_over_https():
+            connection = http.client.HTTPSConnection(
+                "::1",
+                self.receiver_port,
+                timeout=12,
+                context=ssl._create_unverified_context(),
+            )
+            try:
+                connection.request(
+                    "POST",
+                    "/Ask",
+                    body=ask,
+                    headers={"Content-Type": "application/x-apple-plist"},
+                )
+                approval = connection.getresponse()
+                ask_status = approval.status
+                approval.read()
+                if ask_status != 200:
+                    return ask_status, None
+                connection.request(
+                    "POST",
+                    "/Upload",
+                    body=body,
+                    headers={
+                        "Content-Type": "application/x-dvzip",
+                        "TransferID": transfer_id,
+                    },
+                )
+                response = connection.getresponse()
+                status = response.status
+                response.read()
+                return ask_status, status
+            finally:
+                connection.close()
+
+        upload = asyncio.create_task(asyncio.to_thread(send_over_https))
+        try:
+            async with asyncio.timeout(10):
+                while not self.service.incoming:
+                    await asyncio.sleep(0.01)
+            key = next(iter(self.service.incoming))
+            response = await self.control.post(
+                "/", json={"command": "accept", "id": key}
+            )
+            self.assertEqual(response.status, 200)
+            ask_status, upload_status = await asyncio.wait_for(upload, 15)
+        finally:
+            if not upload.done():
+                upload.cancel()
+
+        self.assertEqual(ask_status, 200)
+        self.assertEqual(upload_status, 200)
+        transfer = self.service.transfers[key]
+        self.assertEqual(transfer["state"], "complete")
+        self.assertEqual(Path(transfer["receivedPaths"][0]).read_bytes(), b"new data")
+        self.assertEqual((old_destination / "new.txt").read_bytes(), b"pre-existing target")
+        response = await self.control.post("/", json={"command": "save-received", "id": key})
+        self.assertEqual(response.status, 200)
+        self.assertEqual((Path(self.service.settings["directory"]) / "new.txt").read_bytes(), b"new data")
 
 
 if __name__ == "__main__":

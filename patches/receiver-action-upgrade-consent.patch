@@ -1,0 +1,28 @@
+--- a/bin/airdrop_consent.py
++++ b/bin/airdrop_consent.py
+@@ -120,7 +120,7 @@
+                 return False
+             _grants[key] = {"until": now + 60, "expected": expected,
+                             "id": result.get("transferId"), "token": result.get("token"),
+-                            "bytes": 0, "reported": 0}
++                            "directory": result.get("directory"), "bytes": 0, "reported": 0}
+         return True
+     except (OSError, subprocess.TimeoutExpired, ValueError, KeyError, TypeError, AttributeError) as error:
+         logging.warning("AirDrop approval bridge refused request: %s", error)
+@@ -155,13 +155,15 @@
+         raise ValueError("Archive does not match the approved files")
+ 
+ 
+-def report(grant, state="transferring", count=0):
++def report(grant, state="transferring", count=0, names=None):
+     grant["bytes"] += count
+     now = time.monotonic()
+     if not grant.get("id") or (state == "transferring" and now - grant["reported"] < 0.25):
+         return
+     grant["reported"] = now
+     packet = {"id": grant["id"], "token": grant["token"], "state": state, "bytes": grant["bytes"]}
++    if names is not None:
++        packet["names"] = names
+     if state == "failed":
+         packet["error"] = "AirDrop upload did not finish"
+     try:

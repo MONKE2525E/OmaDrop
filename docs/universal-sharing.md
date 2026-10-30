@@ -48,7 +48,7 @@ consistency check, not an authenticated identity or trusted-sender list.
 Incoming LocalSend and Quick Share files wait for explicit **Accept**.
 Quick Share also displays the engine's verification code. Compare it on both
 devices before accepting. Quick Share receives one approved transfer at a time.
-Files arrive in private staging and are published into the selected folder
+Files arrive in private staging. Saving publishes them to the selected folder
 without overwriting existing files. Invalid names, oversized requests, and
 LocalSend checksum mismatches are rejected.
 
@@ -58,11 +58,10 @@ seconds; rejection, timeout, a stopped coordinator, or a broken approval bridge
 refuses the transfer. Upload without an approved Ask is rejected. Approval
 is bound to the sender address, certificate when supplied, transfer ID, and
 exact file names and sizes. It expires after 60 seconds and is single use.
-Link-only AirDrop requires the same approval. Accepted HTTP/HTTPS links open
-in the default browser without creating a text document. Rejection opens
-nothing, and a link approval cannot authorize a file upload. Receive progress
-is reported for files. Quick Share URL payloads also open after approval;
-other shared text is saved as a text file.
+Link-only AirDrop requires the same approval. Accepted HTTP/HTTPS links and
+Quick Share text or URLs are held as text files for the same three actions.
+Rejection opens nothing, and a link approval cannot authorize a file upload.
+Receive progress is reported for files.
 Outgoing AirDrop transfers do appear; its CLI provides completion rather than
 byte progress. When OmaDrop finds an AirDrop receiver already running, it does
 not take ownership or stop it, or change its receive folder. The common folder
@@ -114,7 +113,7 @@ Clipboard copies are removed after sending or after one hour; original files
 are kept. Send targets one selected peer and returns its queued transfer ID
 immediately. Transfers report file count, first filename and update time.
 Finished, failed, cancelled, and rejected transfers expire three hours after
-their terminal state. History is saved privately in `~/.config/omadrop/transfers.json`
+their terminal state, except receives held for an action. History is saved privately in `~/.config/omadrop/transfers.json`
 and expired rows are removed on restart as well as during use. `dismiss ID` or
 `dismiss all` clears only finished transfers and updates that saved history.
 Transfers with no state or byte progress for five minutes fail and release
@@ -125,15 +124,14 @@ its channel updates the error and retries the receiver without restarting the
 other protocols. Running the regular LocalSend app at the same time
 may occupy port 53317; OmaDrop reports that conflict rather than stopping it.
 
-AirDrop files are saved and announced after approval. Website links open in
-the default browser after approval. Arrivals never touch the clipboard, so
-an incoming file cannot replace what you copied. The pinned receiver used to copy
-every arrival (images as images, links as URLs, other files as their path);
-`patches/receiver-clipboard.patch` removes that. To copy one yourself, run
-`omdrop act copy FILE`. The installer applies the patch after
-`receiver-consent.patch`; an existing receiver install is not changed by
-re-running it, so apply the patch to `bin/omdrop` with `patch -p1` from the
-receiver directory.
+Approved files and links are held privately until the user copies, saves, drags,
+or discards them. Copy uses the clipboard for a single text file or image and
+file URLs for other or multiple files. Save copies to the configured folder
+without overwriting. Drag offers file URLs. Clearing the row removes its held
+files, so copied file URLs must be pasted before clearing. Saved files remain.
+The AirDrop receiver needs the current consent and progress patches to report
+its output into the private holding area. `tools/install-sharing.sh` updates
+the managed receiver and keeps a backup; restart sharing after an update.
 
 ## CLI and diagnostics
 
@@ -146,6 +144,8 @@ omadrop send --peer '<id from status>' --pick
 omadrop accept '<incoming id>'
 omadrop reject '<incoming id>'
 omadrop cancel '<transfer id>'
+omadrop copy-received '<transfer id>'
+omadrop save-received '<transfer id>'
 omadrop directory --pick
 omadrop pick
 omadrop stage-clipboard
@@ -159,7 +159,7 @@ under `$XDG_RUNTIME_DIR/omadrop`. Settings, transfer history, and TLS files live
 Runtime device names and tokens are not written into repository files.
 
 Native checks confirmed AirDrop receiving and Android photo approval. Desktop
-notifications and browser opening were exercised against the installed receiver.
+notifications were exercised against the installed receiver.
 Quick Share and LocalSend local-engine tests cover consent and transferred bytes;
 full native outgoing interoperability across every device remains unverified.
 

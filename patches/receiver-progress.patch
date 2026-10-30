@@ -64,7 +64,7 @@
                  raise ValueError('Archive omitted approved files')
 +            # Keep final reporting inside this rollback scope so cancellation
 +            # removes files already extracted by this request.
-+            airdrop_consent.report(consent, 'complete')
++            airdrop_consent.report(consent, 'complete', names=written)
      except Exception:
          for name in reversed(created):
              try:
@@ -90,11 +90,13 @@
 +        completed = False
          try:
 +            airdrop_consent.report(consent)
-             receive_budget = ReceiveBudget(DEST, MAX_RECEIVE_PERCENT)
+-            receive_budget = ReceiveBudget(DEST, MAX_RECEIVE_PERCENT)
++            receive_budget = ReceiveBudget(consent['directory'], MAX_RECEIVE_PERCENT)
              plan = body_plan(self.headers, receive_budget.byte_limit)
              logging.info(
 @@ -883,12 +896,14 @@
-             with tempfile.TemporaryFile(dir=DEST) as raw:
+-            with tempfile.TemporaryFile(dir=DEST) as raw:
++            with tempfile.TemporaryFile(dir=consent['directory']) as raw:
                  wire_bytes = read_request_body(
                      self.rfile, self.headers, raw, receive_budget.byte_limit,
 -                    check_disk=True, plan=plan, deadline=deadline)
@@ -103,7 +105,8 @@
                  raw.seek(0)
                  logging.info('upload %s: %d bytes dvzip (TotalBytes %s)',
                               tid, wire_bytes, self.headers.get('TotalBytes'))
-                 written = store_upload(raw, DEST, tid, receive_budget, consent)
+-                written = store_upload(raw, DEST, tid, receive_budget, consent)
++                written = store_upload(raw, consent['directory'], tid, receive_budget, consent)
              logging.info('upload %s: stored %s', tid, ', '.join(written))
 +            completed = True
          except socket.timeout as e:

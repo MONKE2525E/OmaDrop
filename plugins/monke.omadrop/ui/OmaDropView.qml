@@ -31,6 +31,7 @@ Item {
   // Ids with an action in flight, so a button cannot be pressed twice.
   property var busy: ({})
   property bool pickingDirectory: false
+  property string copiedReceivedId: ""
   // A quiet, expected outcome of staging (an empty clipboard), not a failure.
   property string stageHint: ""
   // Startup, from the panel: the backend is bringing the radios up, or it has
@@ -56,6 +57,8 @@ Item {
   signal rejectRequested(string id)
   signal cancelRequested(string id)
   signal dismissRequested(string id)
+  signal copyReceivedRequested(string id)
+  signal saveReceivedRequested(string id)
   signal keepVisibleRequested()
   signal stopVisibleRequested()
   signal pickDirectoryRequested()
@@ -163,9 +166,14 @@ Item {
   }
 
   function finishedFor(direction) {
-    return transfers.filter(function(t) {
+    var rows = transfers.filter(function(t) {
       return t.direction === direction && !isLive(t) && cleared[t.id] !== true
-    }).reverse().slice(0, 4)
+    }).reverse()
+    var kept = 0
+    return rows.filter(function(t) {
+      if (t.receivedPaths && t.receivedPaths.length) return true
+      return kept++ < 4
+    })
   }
 
   function protocolName(id) {
@@ -250,7 +258,7 @@ Item {
     case "preparing":    return "Preparing"
     case "waiting":      return out ? "Waiting for approval" : "Waiting for sender"
     case "transferring": return Math.round(transferFraction(t) * 100) + "%"
-    case "complete":     return out ? "Sent" : "Saved"
+    case "complete":     return out ? "Sent" : t.receivedPaths && t.receivedPaths.length && !(t.savedPaths && t.savedPaths.length) ? "Received" : "Saved"
     case "rejected":     return out ? "Declined" : "Rejected"
     case "failed":       return "Failed"
     case "cancelled":    return "Cancelled"
@@ -420,8 +428,8 @@ Item {
       SmallBtn {
         visible: !xfer.live
         enabled: !root.isBusy(xfer.t.id)
-        text: "Clear"
-        Accessible.name: "Clear transfer " + root.transferTitle(xfer.t)
+        text: xfer.t.receivedPaths && xfer.t.receivedPaths.length && !(xfer.t.savedPaths && xfer.t.savedPaths.length) ? "Discard" : "Clear"
+        Accessible.name: text + " transfer " + root.transferTitle(xfer.t)
         onClicked: root.dismissRequested(xfer.t.id)
       }
     }
@@ -455,6 +463,50 @@ Item {
         visible: xfer.t.state === "transferring" && Number(xfer.t.total) > 0
         text: root.formatSize(xfer.t.bytes) + " / " + root.formatSize(xfer.t.total)
       }
+    }
+    RowLayout {
+      visible: xfer.t.direction === "in" && xfer.t.state === "complete" && !!xfer.t.receivedPaths && xfer.t.receivedPaths.length > 0
+      Layout.fillWidth: true
+      spacing: Style.space(8)
+      SmallBtn {
+        text: root.copiedReceivedId === xfer.t.id ? "Copied" : "Copy"
+        enabled: !root.isBusy(xfer.t.id)
+        Accessible.name: "Copy " + root.transferTitle(xfer.t)
+        onClicked: root.copyReceivedRequested(xfer.t.id)
+      }
+      SmallBtn {
+        text: xfer.t.savedPaths && xfer.t.savedPaths.length ? "Saved" : "Save"
+        enabled: !root.isBusy(xfer.t.id) && !(xfer.t.savedPaths && xfer.t.savedPaths.length)
+        Accessible.name: "Save " + root.transferTitle(xfer.t)
+        onClicked: root.saveReceivedRequested(xfer.t.id)
+      }
+      Rectangle {
+        id: dragButton
+        implicitWidth: dragLabel.implicitWidth + Style.space(20)
+        implicitHeight: dragLabel.implicitHeight + Style.space(10)
+        color: "transparent"
+        border.color: root.foreground
+        border.width: 1
+        Accessible.role: Accessible.Button
+        Accessible.name: "Drag " + root.transferTitle(xfer.t)
+        Label { id: dragLabel; anchors.centerIn: parent; text: "Drag"; font.pixelSize: Style.font.bodySmall }
+        Drag.dragType: Drag.Automatic
+        Drag.supportedActions: Qt.CopyAction
+        Drag.active: dragHandler.active
+        Drag.mimeData: ({"text/uri-list": (xfer.t.receivedPaths || []).map(function(p) {
+          return "file://" + p.split("/").map(encodeURIComponent).join("/")
+        }).join("\r\n") + "\r\n"})
+        DragHandler { id: dragHandler; target: null }
+
+      }
+      Item { Layout.fillWidth: true }
+    }
+    Meta {
+      visible: xfer.t.direction === "in" && xfer.t.state === "complete" && !!xfer.t.receivedPaths && xfer.t.receivedPaths.length > 0
+      Layout.fillWidth: true
+      text: xfer.t.savedPaths && xfer.t.savedPaths.length ? "Saved to " + root.tildify(String(xfer.t.savedPaths[0]).substring(0, String(xfer.t.savedPaths[0]).lastIndexOf("/"))) : "Held until discarded · Save to keep"
+      wrapMode: Text.Wrap
+      elide: Text.ElideNone
     }
     Note {
       visible: !!xfer.t.error && xfer.bad && xfer.t.state !== "rejected"
